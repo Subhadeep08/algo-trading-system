@@ -5,3 +5,5 @@ __pycache__/
 *.csv
 *.pkl
 .DS_Store
+references/telegram-config.md
+references/live-prices.md
