@@ -1,0 +1,78 @@
+name: Update Portfolio Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Trade action'
+        required: true
+        type: choice
+        options:
+          - buy
+          - sell
+          - update_sl
+          - add_gtt
+          - remove_gtt
+      ticker:
+        description: 'NSE ticker (e.g. APARINDS, CGPOWER)'
+        required: true
+        type: string
+      qty:
+        description: 'Quantity of shares (buy / sell only)'
+        required: false
+        type: string
+        default: '0'
+      price:
+        description: 'Price per share — cost price for buy, GTT level for add_gtt'
+        required: false
+        type: string
+        default: '0'
+      sl:
+        description: 'Stop-loss price (buy / update_sl only)'
+        required: false
+        type: string
+        default: '0'
+      target:
+        description: 'Target price (buy / add_gtt only)'
+        required: false
+        type: string
+        default: '0'
+      catalyst:
+        description: 'Key catalyst / reason (optional, shown in portfolio-data.md)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run portfolio updater
+        run: |
+          python scripts/update_portfolio.py \
+            --action "${{ github.event.inputs.action }}" \
+            --ticker "${{ github.event.inputs.ticker }}" \
+            --qty "${{ github.event.inputs.qty }}" \
+            --price "${{ github.event.inputs.price }}" \
+            --sl "${{ github.event.inputs.sl }}" \
+            --target "${{ github.event.inputs.target }}" \
+            --catalyst "${{ github.event.inputs.catalyst }}"
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .claude/skills/portfolio-cockpit/references/portfolio-data.md \
+                  scripts/cockpit_runner.py \
+                  scripts/fetch_nse_prices.py
+          git diff --staged --quiet || git commit -m \
+            "trade: ${{ github.event.inputs.action }} ${{ github.event.inputs.ticker }} [automated]"
+          git push
