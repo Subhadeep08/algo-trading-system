@@ -1,146 +1,95 @@
-"""
-Fetches live NSE prices via yfinance and writes references/live-prices.md.
-Run this before each portfolio-cockpit phase so the skill reads fresh CMPs
-instead of relying on web-search snippets.
-
-Usage:
-    python scripts/fetch_nse_prices.py
-"""
-
-import datetime
-import os
-import sys
-
+"""Fetch live NSE prices via yfinance and write references/live-prices.md."""
 import yfinance as yf
+from datetime import datetime
 
-HOLDINGS = {
-    "APARINDS":      {"qty": 3,   "cost": 13577.33, "sl": 15132.00, "target": 18000.00},
-    "CUMMINSIND":    {"qty": 9,   "cost": 5660.83,  "sl": 5472.00,  "target": 7300.00},
-    "AEGISLOG":      {"qty": 40,  "cost": 1002.55,  "sl": 1060.00,  "target": 1350.00},
-    "APTUSVALUE":    {"qty": 310, "cost": 294.70,   "sl": 251.46,   "target": 350.00},
-    "KIRLOSENG":     {"qty": 10,  "cost": 2364.70,  "sl": 2290.00,  "target": 3100.00},
-}
+HOLDINGS = [
+    {"ticker": "APARINDS",   "yf": "APARINDS.NS",   "qty": 3,   "cost": 13577.33, "sl": 15132.00, "target": 18000.00},
+    {"ticker": "CUMMINSIND", "yf": "CUMMINSIND.NS", "qty": 9,   "cost": 5660.83,  "sl": 5472.00,  "target": 7300.00},
+    {"ticker": "AEGISLOG",   "yf": "AEGISLOG.NS",   "qty": 40,  "cost": 1002.55,  "sl": 1060.00,  "target": 1350.00},
+    {"ticker": "APTUSVALUE", "yf": "APTUSVALUE.NS", "qty": 310, "cost": 294.70,   "sl": 251.46,   "target": 350.00},
+    {"ticker": "KIRLOSENG",  "yf": "KIRLOSENG.NS",  "qty": 10,  "cost": 2364.70,  "sl": 2290.00,  "target": 3100.00},
+]
 
-GTT_ORDERS = {
-    "CGPOWER":         {"gtt": 930.00,  "target": 1120.00},
-    "PRIVISPECIALITY": {"gtt": 3350.00, "target": 4025.00},
-    "SYRMA":           {"gtt": 1275.00, "target": 1600.00},
-}
+GTTS = [
+    {"ticker": "CGPOWER",         "yf": "CGPOWER.NS",    "gtt": 930.00,  "target": 1120.00},
+    {"ticker": "PRIVISPECIALITY", "yf": "PRIVISCL.NS",   "gtt": 3350.00, "target": 4025.00},
+    {"ticker": "SYRMA",           "yf": "SYRMA.NS",      "gtt": 1275.00, "target": 1600.00},
+]
 
-
-def fetch_price(nse_symbol: str) -> float | None:
+def fetch_price(yf_ticker):
     try:
-        ticker = yf.Ticker(f"{nse_symbol}.NS")
-        price = ticker.fast_info.last_price
-        return round(float(price), 2) if price and float(price) > 0 else None
-    except Exception as e:
-        print(f"  WARN: could not fetch {nse_symbol}: {e}", file=sys.stderr)
-        return None
-
-
-def fetch_index(yahoo_symbol: str) -> float | None:
-    try:
-        price = yf.Ticker(yahoo_symbol).fast_info.last_price
-        return round(float(price), 2) if price and float(price) > 0 else None
+        t = yf.Ticker(yf_ticker)
+        info = t.fast_info
+        price = info.last_price
+        prev_close = info.previous_close
+        return round(price, 2), round(prev_close, 2) if prev_close else None
     except Exception:
-        return None
+        return None, None
 
+def pct(a, b):
+    if b and b != 0:
+        return round((a - b) / b * 100, 2)
+    return None
 
-def write_live_prices():
-    now_ist = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
-    timestamp = now_ist.strftime("%Y-%m-%d %H:%M IST")
+lines = []
+lines.append(f"# Live NSE Prices — Fetched: {datetime.now().strftime('%Y-%m-%d %H:%M IST')}\n")
+lines.append("## Active Holdings\n")
+lines.append("| Ticker | CMP (Rs) | Prev Close (Rs) | Day Chg% | Cost (Rs) | P&L% | SL (Rs) | SL Buffer% | Target (Rs) | Upside% |")
+lines.append("|--------|----------|-----------------|----------|-----------|------|---------|------------|-------------|---------|")
 
-    # ── Holdings table ────────────────────────────────────────────────────────
-    holding_rows = []
-    total_invested = 0.0
-    total_current = 0.0
+total_cost_value = 0
+total_current_value = 0
 
-    for ticker, d in HOLDINGS.items():
-        cmp = fetch_price(ticker)
-        invested = d["cost"] * d["qty"]
-        total_invested += invested
-        if cmp:
-            current_val = cmp * d["qty"]
-            total_current += current_val
-            pnl_pct = (cmp - d["cost"]) / d["cost"] * 100
-            sl_buffer = (cmp - d["sl"]) / d["sl"] * 100
-            holding_rows.append(
-                f"| {ticker} | {cmp:,.2f} | {d['cost']:,.2f} | {d['sl']:,.2f} "
-                f"| {d['target']:,.2f} | {pnl_pct:+.2f}% | {sl_buffer:+.2f}% |"
-            )
-        else:
-            total_current += invested  # fallback: assume flat
-            holding_rows.append(
-                f"| {ticker} | UNAVAILABLE | {d['cost']:,.2f} | {d['sl']:,.2f} "
-                f"| {d['target']:,.2f} | — | — |"
-            )
-
-    # ── GTT table ─────────────────────────────────────────────────────────────
-    gtt_rows = []
-    for ticker, d in GTT_ORDERS.items():
-        cmp = fetch_price(ticker)
-        if cmp:
-            dist = (cmp - d["gtt"]) / d["gtt"] * 100
-            proximity = "APPROACHING — monitor" if abs(dist) <= 3 else ("TRIGGERED — verify Groww" if dist <= 0 else "")
-            gtt_rows.append(
-                f"| {ticker} | {cmp:,.2f} | {d['gtt']:,.2f} | {d['target']:,.2f} "
-                f"| {dist:+.2f}% | {proximity} |"
-            )
-        else:
-            gtt_rows.append(
-                f"| {ticker} | UNAVAILABLE | {d['gtt']:,.2f} | {d['target']:,.2f} | — | — |"
-            )
-
-    # ── Indices ───────────────────────────────────────────────────────────────
-    nifty50  = fetch_index("^NSEI")
-    nifty500 = fetch_index("^CRSLDX")
-
-    nifty50_str  = f"{nifty50:,.2f}"  if nifty50  else "UNAVAILABLE"
-    nifty500_str = f"{nifty500:,.2f}" if nifty500 else "UNAVAILABLE"
-
-    portfolio_pnl = (total_current - total_invested) / total_invested * 100
-
-    # ── Write file ────────────────────────────────────────────────────────────
-    lines = [
-        f"# Live NSE Prices — {timestamp}",
-        "",
-        "> Auto-generated by scripts/fetch_nse_prices.py — do not edit manually.",
-        "> Refresh by running: python scripts/fetch_nse_prices.py",
-        "",
-        "## Portfolio Summary",
-        "",
-        f"- Total Invested : Rs {total_invested:,.2f}",
-        f"- Current Value  : Rs {total_current:,.2f}",
-        f"- Unrealised P&L : {portfolio_pnl:+.2f}%",
-        "",
-        "## Active Holdings",
-        "",
-        "| Ticker | CMP (Rs) | Cost (Rs) | SL (Rs) | Target (Rs) | P&L (%) | SL Buffer (%) |",
-        "|--------|----------|-----------|---------|-------------|---------|---------------|",
-        *holding_rows,
-        "",
-        "## Pending GTT Orders",
-        "",
-        "| Ticker | CMP (Rs) | GTT Level (Rs) | Target (Rs) | Distance to GTT (%) | Alert |",
-        "|--------|----------|----------------|-------------|---------------------|-------|",
-        *gtt_rows,
-        "",
-        "## Benchmark Indices",
-        "",
-        f"- Nifty 50  : {nifty50_str}",
-        f"- Nifty 500 : {nifty500_str}",
-        "",
-    ]
-
-    out_path = os.path.join(
-        os.path.dirname(__file__), "..", "references", "live-prices.md"
+for h in HOLDINGS:
+    cmp, prev = fetch_price(h["yf"])
+    if cmp is None:
+        lines.append(f"| {h['ticker']} | N/A | N/A | N/A | {h['cost']:,.2f} | N/A | {h['sl']:,.2f} | N/A | {h['target']:,.2f} | N/A |")
+        continue
+    day_chg = pct(cmp, prev) if prev else None
+    pnl = pct(cmp, h["cost"])
+    sl_buf = pct(cmp, h["sl"])
+    upside = pct(h["target"], cmp)
+    total_cost_value += h["qty"] * h["cost"]
+    total_current_value += h["qty"] * cmp
+    day_str = f"{day_chg:+.2f}%" if day_chg is not None else "N/A"
+    prev_str = f"{prev:,.2f}" if prev else "N/A"
+    lines.append(
+        f"| {h['ticker']} | {cmp:,.2f} | {prev_str} | {day_str} | "
+        f"{h['cost']:,.2f} | {pnl:+.2f}% | {h['sl']:,.2f} | {sl_buf:+.2f}% | "
+        f"{h['target']:,.2f} | {upside:+.2f}% |"
     )
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
 
-    print(f"[OK] live-prices.md updated at {timestamp}")
-    print(f"     Portfolio P&L: {portfolio_pnl:+.2f}%")
+total_pnl_pct = pct(total_current_value, total_cost_value)
+lines.append(f"\n**Portfolio Total Cost:** Rs {total_cost_value:,.2f}")
+lines.append(f"**Portfolio Current Value:** Rs {total_current_value:,.2f}")
+pnl_str = f"{total_pnl_pct:+.2f}%" if total_pnl_pct is not None else "N/A"
+lines.append(f"**Unrealised P&L:** {pnl_str}\n")
 
+lines.append("## Pending GTT Orders\n")
+lines.append("| Ticker | CMP (Rs) | GTT Level (Rs) | Distance% | Target (Rs) | Upside from GTT% |")
+lines.append("|--------|----------|----------------|-----------|-------------|-----------------|")
 
-if __name__ == "__main__":
-    write_live_prices()
+for g in GTTS:
+    cmp, prev = fetch_price(g["yf"])
+    if cmp is None:
+        lines.append(f"| {g['ticker']} | N/A | {g['gtt']:,.2f} | N/A | {g['target']:,.2f} | N/A |")
+        continue
+    dist = pct(cmp, g["gtt"])
+    upside_from_gtt = pct(g["target"], g["gtt"])
+    flag = ""
+    if dist is not None:
+        if dist <= 0:
+            flag = " [AT/BELOW GTT - CHECK]"
+        elif dist <= 3:
+            flag = " [APPROACHING]"
+    dist_str = f"{dist:+.2f}%{flag}" if dist is not None else "N/A"
+    lines.append(
+        f"| {g['ticker']} | {cmp:,.2f} | {g['gtt']:,.2f} | {dist_str} | "
+        f"{g['target']:,.2f} | {upside_from_gtt:+.2f}% |"
+    )
+
+output = "\n".join(lines)
+with open("references/live-prices.md", "w") as f:
+    f.write(output)
+print("Written to references/live-prices.md")
+print(output)
