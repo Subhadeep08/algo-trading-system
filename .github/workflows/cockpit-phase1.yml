@@ -1,0 +1,23 @@
+name: Portfolio Cockpit — Phase 1 Pre-Market
+
+on:
+  schedule:
+    - cron: '35 3 * * 1-5'   # 09:05 IST (Mon–Fri)
+  workflow_dispatch:           # allow manual trigger from GitHub UI
+
+jobs:
+  phase1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install yfinance requests anthropic pytz
+      - name: Run Phase 1 Pre-Market Diagnostic
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/cockpit_runner.py --phase 1
