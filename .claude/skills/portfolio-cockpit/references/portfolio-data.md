@@ -11,7 +11,7 @@ Update this file whenever holdings, stop-losses, GTT levels, or targets change.
 | KIRLOSENG      | 25  | 2,349.88        | 2,290.00                | 3,100.00          | 192 MW HyperNext order; data center monopoly crack |
 | AEGISLOG       | 40  | 1,002.55        | 1,190.00                | 1,350.00          | Record Liquid Logistics EBITDA; Royal Vopak JV |
 | CUMMINSIND     | 9   | 5,660.83        | 5,472.00                | 7,300.00          | Data center backup power demand; above 20/50 EMA |
-| NAVINFLUOR     | 6   | 7,510.00        | 7,103.00                | TBD               | Confirm target with user |
+| NAVINFLUOR     | 6   | 7,510.00        | 7,103.00                | 9,250.00          | Specialty fluorochemicals; R-32 refrigerant + CDMO pipeline |
 | WELCORP        | 30  | 1,491.70        | 1,423.00                | TBD               | Confirm target with user |
 
 ## Pending GTT Limit Buys
