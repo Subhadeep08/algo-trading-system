@@ -70,9 +70,10 @@ def fmt_holdings(holdings: dict) -> str:
     rows = [f'HOLDINGS = {{']
     for t, d in holdings.items():
         sp = " " * (pad - len(t))
+        target_val = f"{d['target']:.2f}" if d["target"] is not None else "None"
         rows.append(
             f'    "{t}":{sp}{{"qty": {d["qty"]}, "cost": {d["cost"]:.2f}, '
-            f'"sl": {d["sl"]:.2f}, "target": {d["target"]:.2f}}},'
+            f'"sl": {d["sl"]:.2f}, "target": {target_val}}},'
         )
     rows.append("}")
     return "\n".join(rows)
@@ -106,9 +107,10 @@ def write_portfolio_md(holdings: dict, gtt: dict, catalysts: dict):
     ]
     for t, d in holdings.items():
         catalyst = catalysts.get(t, "")
+        target_str = f"{d['target']:>17,.2f}" if d["target"] is not None else f"{'TBD':>17}"
         lines.append(
             f"| {t:<20}| {d['qty']:<4}| {d['cost']:>15,.2f} | {d['sl']:>23,.2f} "
-            f"| {d['target']:>17,.2f} | {catalyst} |"
+            f"| {target_str} | {catalyst} |"
         )
     lines += [
         "",
