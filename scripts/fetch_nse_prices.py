@@ -3,17 +3,19 @@ import yfinance as yf
 from datetime import datetime
 
 HOLDINGS = [
-    {"ticker": "APARINDS",   "yf": "APARINDS.NS",   "qty": 3,   "cost": 13577.33, "sl": 15132.00, "target": 18000.00},
+    {"ticker": "APTUS",      "yf": "APTUS.NS",      "qty": 310, "cost": 294.70,   "sl": 280.00,   "target": 350.00},
+    {"ticker": "APARINDS",   "yf": "APARINDS.NS",   "qty": 4,   "cost": 14838.00, "sl": 14154.00, "target": 18000.00},
+    {"ticker": "KIRLOSENG",  "yf": "KIRLOSENG.NS",  "qty": 25,  "cost": 2349.88,  "sl": 2290.00,  "target": 3100.00},
+    {"ticker": "AEGISLOG",   "yf": "AEGISLOG.NS",   "qty": 40,  "cost": 1002.55,  "sl": 1190.00,  "target": 1350.00},
     {"ticker": "CUMMINSIND", "yf": "CUMMINSIND.NS", "qty": 9,   "cost": 5660.83,  "sl": 5472.00,  "target": 7300.00},
-    {"ticker": "AEGISLOG",   "yf": "AEGISLOG.NS",   "qty": 40,  "cost": 1002.55,  "sl": 1060.00,  "target": 1350.00},
-    {"ticker": "APTUSVALUE", "yf": "APTUSVALUE.NS", "qty": 310, "cost": 294.70,   "sl": 251.46,   "target": 350.00},
-    {"ticker": "KIRLOSENG",  "yf": "KIRLOSENG.NS",  "qty": 10,  "cost": 2364.70,  "sl": 2290.00,  "target": 3100.00},
+    {"ticker": "NAVINFLUOR", "yf": "NAVINFLUOR.NS", "qty": 6,   "cost": 7510.00,  "sl": 7103.00,  "target": 9250.00},
+    {"ticker": "WELCORP",    "yf": "WELCORP.NS",    "qty": 30,  "cost": 1491.70,  "sl": 1423.00,  "target": None},
 ]
 
 GTTS = [
-    {"ticker": "CGPOWER",         "yf": "CGPOWER.NS",    "gtt": 930.00,  "target": 1120.00},
-    {"ticker": "PRIVISPECIALITY", "yf": "PRIVISCL.NS",   "gtt": 3350.00, "target": 4025.00},
-    {"ticker": "SYRMA",           "yf": "SYRMA.NS",      "gtt": 1275.00, "target": 1600.00},
+    {"ticker": "CGPOWER",  "yf": "CGPOWER.NS",  "gtt": 930.00,  "target": 1120.00},
+    {"ticker": "PRIVISCL", "yf": "PRIVISCL.NS", "gtt": 3350.00, "target": 4025.00},
+    {"ticker": "SYRMA",    "yf": "SYRMA.NS",    "gtt": 1275.00, "target": 1600.00},
 ]
 
 def fetch_price(yf_ticker):
@@ -48,15 +50,17 @@ for h in HOLDINGS:
     day_chg = pct(cmp, prev) if prev else None
     pnl = pct(cmp, h["cost"])
     sl_buf = pct(cmp, h["sl"])
-    upside = pct(h["target"], cmp)
+    upside = pct(h["target"], cmp) if h["target"] else None
     total_cost_value += h["qty"] * h["cost"]
     total_current_value += h["qty"] * cmp
-    day_str = f"{day_chg:+.2f}%" if day_chg is not None else "N/A"
-    prev_str = f"{prev:,.2f}" if prev else "N/A"
+    day_str    = f"{day_chg:+.2f}%" if day_chg is not None else "N/A"
+    prev_str   = f"{prev:,.2f}" if prev else "N/A"
+    target_str = f"{h['target']:,.2f}" if h["target"] else "TBD"
+    upside_str = f"{upside:+.2f}%" if upside is not None else "TBD"
     lines.append(
         f"| {h['ticker']} | {cmp:,.2f} | {prev_str} | {day_str} | "
         f"{h['cost']:,.2f} | {pnl:+.2f}% | {h['sl']:,.2f} | {sl_buf:+.2f}% | "
-        f"{h['target']:,.2f} | {upside:+.2f}% |"
+        f"{target_str} | {upside_str} |"
     )
 
 total_pnl_pct = pct(total_current_value, total_cost_value)
