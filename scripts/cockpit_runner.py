@@ -13,11 +13,11 @@ HOLDINGS = {
     "AEGISLOG":   {"qty": 40,  "cost": 1002.55,  "sl": 1190.00,  "target": 1350.00},
     "CUMMINSIND": {"qty": 9,   "cost": 5660.83,  "sl": 5472.00,  "target": 7300.00},
     "NAVINFLUOR": {"qty": 6,   "cost": 7510.00,  "sl": 7103.00,  "target": 9250.00},
-    "WELCORP":    {"qty": 30,  "cost": 1491.70,  "sl": 1423.00,  "target": None},
+    "WELCORP":    {"qty": 30,  "cost": 1491.70,  "sl": 1350.00,  "target": None},
+    "CGPOWER":    {"qty": 50,  "cost": 898.46,   "sl": 880.00,   "target": 1120.00},
 }
 
 GTT_ORDERS = {
-    "CGPOWER":  {"gtt": 930.00,  "target": 1120.00},
     "PRIVISCL": {"gtt": 3350.00, "target": 4025.00},
     "SYRMA":    {"gtt": 1275.00, "target": 1600.00},
 }
