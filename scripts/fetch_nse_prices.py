@@ -21,7 +21,7 @@ NSE_TICKER_SUFFIX = ".NS"
 
 HOLDINGS = {
     "APTUS":      {"qty": 310, "cost": 294.70,   "sl": 280.00,   "target": 350.00},
-    "APARINDS":   {"qty": 4,   "cost": 14838.00, "sl": 14154.00, "target": 18000.00},
+    "APARINDS":   {"qty": 4,   "cost": 14838.00, "sl": 14000.00, "target": 18000.00},
     "KIRLOSENG":  {"qty": 25,  "cost": 2349.88,  "sl": 2290.00,  "target": 3100.00},
     "AEGISLOG":   {"qty": 40,  "cost": 1002.55,  "sl": 1190.00,  "target": 1350.00},
     "CUMMINSIND": {"qty": 9,   "cost": 5660.83,  "sl": 5472.00,  "target": 7300.00},
@@ -31,8 +31,8 @@ HOLDINGS = {
 }
 
 GTT_ORDERS = {
-    "PRIVISCL": {"gtt": 3350.00, "target": 4025.00},
-    "SYRMA":    {"gtt": 1275.00, "target": 1600.00},
+    "PRIVISCL": {"qty": 10, "gtt": 3350.00, "target": 4025.00},
+    "SYRMA":    {"qty": 30, "gtt": 1275.00, "target": 1600.00},
 }
 
 
