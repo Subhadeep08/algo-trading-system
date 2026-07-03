@@ -9,11 +9,11 @@ HOLDINGS = [
     {"ticker": "AEGISLOG",   "yf": "AEGISLOG.NS",   "qty": 40,  "cost": 1002.55,  "sl": 1190.00,  "target": 1350.00},
     {"ticker": "CUMMINSIND", "yf": "CUMMINSIND.NS", "qty": 9,   "cost": 5660.83,  "sl": 5472.00,  "target": 7300.00},
     {"ticker": "NAVINFLUOR", "yf": "NAVINFLUOR.NS", "qty": 6,   "cost": 7510.00,  "sl": 7103.00,  "target": 9250.00},
-    {"ticker": "WELCORP",    "yf": "WELCORP.NS",    "qty": 30,  "cost": 1491.70,  "sl": 1423.00,  "target": None},
+    {"ticker": "WELCORP",    "yf": "WELCORP.NS",    "qty": 30,  "cost": 1491.70,  "sl": 1350.00,  "target": None},
+    {"ticker": "CGPOWER",    "yf": "CGPOWER.NS",    "qty": 50,  "cost": 898.46,   "sl": 880.00,   "target": 1120.00},
 ]
 
 GTTS = [
-    {"ticker": "CGPOWER",  "yf": "CGPOWER.NS",  "gtt": 930.00,  "target": 1120.00},
     {"ticker": "PRIVISCL", "yf": "PRIVISCL.NS", "gtt": 3350.00, "target": 4025.00},
     {"ticker": "SYRMA",    "yf": "SYRMA.NS",    "gtt": 1275.00, "target": 1600.00},
 ]
