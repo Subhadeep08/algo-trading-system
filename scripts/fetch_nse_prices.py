@@ -1,6 +1,23 @@
 """Fetch live NSE prices via yfinance and write references/live-prices.md."""
-import yfinance as yf
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import yfinance as yf
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+OUTPUT_FILE      = Path(__file__).resolve().parent.parent / "references" / "live-prices.md"
+NSE_TICKER_SUFFIX = ".NS"
+
+# IMPORTANT: variable names and inner dict keys are read and written by
+# update_portfolio.py via AST. Do not rename HOLDINGS / GTT_ORDERS or their keys.
 
 HOLDINGS = {
     "APTUS":      {"qty": 310, "cost": 294.70,   "sl": 280.00,   "target": 350.00},
@@ -19,84 +36,242 @@ GTT_ORDERS = {
 }
 
 
-def fetch_price(yf_ticker):
-    try:
-        t = yf.Ticker(yf_ticker)
-        info = t.fast_info
-        price = info.last_price
-        prev_close = info.previous_close
-        return round(price, 2), round(prev_close, 2) if prev_close else None
-    except Exception:
-        return None, None
+# ── Domain value objects ──────────────────────────────────────────────────────
+
+@dataclass
+class HoldingPriceRow:
+    """Fetched price data for a single held position, with derived risk metrics."""
+
+    ticker: str
+    current_price: Optional[float]
+    previous_close: Optional[float]
+    quantity: int
+    average_cost: float
+    stop_loss_price: float
+    target_price: Optional[float]
+
+    @property
+    def day_change_pct(self) -> Optional[float]:
+        if self.current_price is None or self.previous_close is None:
+            return None
+        return (self.current_price - self.previous_close) / self.previous_close * 100
+
+    @property
+    def profit_loss_pct(self) -> Optional[float]:
+        if self.current_price is None:
+            return None
+        return (self.current_price - self.average_cost) / self.average_cost * 100
+
+    @property
+    def stop_loss_buffer_pct(self) -> Optional[float]:
+        if self.current_price is None:
+            return None
+        return (self.current_price - self.stop_loss_price) / self.stop_loss_price * 100
+
+    @property
+    def upside_to_target_pct(self) -> Optional[float]:
+        if self.current_price is None or self.target_price is None:
+            return None
+        return (self.target_price - self.current_price) / self.current_price * 100
+
+    @property
+    def market_value(self) -> Optional[float]:
+        if self.current_price is None:
+            return None
+        return self.current_price * self.quantity
+
+    @property
+    def book_value(self) -> float:
+        return self.average_cost * self.quantity
 
 
-def pct(a, b):
-    if b and b != 0:
-        return round((a - b) / b * 100, 2)
-    return None
+@dataclass
+class GttPriceRow:
+    """Fetched price data for a single pending GTT limit-buy order."""
+
+    ticker: str
+    current_price: Optional[float]
+    trigger_price: float
+    target_price: float
+
+    @property
+    def distance_to_trigger_pct(self) -> Optional[float]:
+        if self.current_price is None:
+            return None
+        return (self.current_price - self.trigger_price) / self.trigger_price * 100
+
+    @property
+    def upside_from_trigger_pct(self) -> float:
+        return (self.target_price - self.trigger_price) / self.trigger_price * 100
 
 
-lines = []
-lines.append(f"# Live NSE Prices — Fetched: {datetime.now().strftime('%Y-%m-%d %H:%M IST')}\n")
-lines.append("## Active Holdings\n")
-lines.append("| Ticker | CMP (Rs) | Prev Close (Rs) | Day Chg% | Cost (Rs) | P&L% | SL (Rs) | SL Buffer% | Target (Rs) | Upside% |")
-lines.append("|--------|----------|-----------------|----------|-----------|------|---------|------------|-------------|---------|")
+# ── Price fetcher ─────────────────────────────────────────────────────────────
 
-total_cost_value = 0
-total_current_value = 0
+class NsePriceFetcher:
+    """Fetches current and previous-close prices from yfinance for NSE-listed stocks."""
 
-for ticker, h in HOLDINGS.items():
-    cmp, prev = fetch_price(f"{ticker}.NS")
-    target_str = f"{h['target']:,.2f}" if h["target"] is not None else "TBD"
-    if cmp is None:
-        lines.append(f"| {ticker} | N/A | N/A | N/A | {h['cost']:,.2f} | N/A | {h['sl']:,.2f} | N/A | {target_str} | N/A |")
-        continue
-    day_chg = pct(cmp, prev) if prev else None
-    pnl = pct(cmp, h["cost"])
-    sl_buf = pct(cmp, h["sl"])
-    upside = pct(h["target"], cmp) if h["target"] is not None else None
-    total_cost_value += h["qty"] * h["cost"]
-    total_current_value += h["qty"] * cmp
-    day_str    = f"{day_chg:+.2f}%" if day_chg is not None else "N/A"
-    prev_str   = f"{prev:,.2f}" if prev else "N/A"
-    upside_str = f"{upside:+.2f}%" if upside is not None else "TBD"
-    lines.append(
-        f"| {ticker} | {cmp:,.2f} | {prev_str} | {day_str} | "
-        f"{h['cost']:,.2f} | {pnl:+.2f}% | {h['sl']:,.2f} | {sl_buf:+.2f}% | "
-        f"{target_str} | {upside_str} |"
+    def fetch_raw_price(
+        self, nse_ticker: str
+    ) -> tuple[Optional[float], Optional[float]]:
+        """Return (current_price, previous_close) for an NSE symbol, or (None, None) on failure."""
+        try:
+            quote = yf.Ticker(f"{nse_ticker}{NSE_TICKER_SUFFIX}").fast_info
+            current_price  = quote.last_price
+            previous_close = quote.previous_close
+            if current_price is None:
+                raise ValueError("No price returned by yfinance feed")
+            return (
+                round(current_price, 2),
+                round(previous_close, 2) if previous_close is not None else None,
+            )
+        except Exception as exc:
+            logger.warning("Price fetch failed for %s: %s", nse_ticker, exc)
+            return None, None
+
+    def build_holding_price_rows(self) -> list[HoldingPriceRow]:
+        """Fetch prices for all HOLDINGS and return as typed rows."""
+        rows: list[HoldingPriceRow] = []
+        for ticker, config in HOLDINGS.items():
+            current_price, previous_close = self.fetch_raw_price(ticker)
+            rows.append(HoldingPriceRow(
+                ticker=ticker,
+                current_price=current_price,
+                previous_close=previous_close,
+                quantity=config["qty"],
+                average_cost=config["cost"],
+                stop_loss_price=config["sl"],
+                target_price=config["target"],
+            ))
+        return rows
+
+    def build_gtt_price_rows(self) -> list[GttPriceRow]:
+        """Fetch prices for all GTT_ORDERS and return as typed rows."""
+        rows: list[GttPriceRow] = []
+        for ticker, config in GTT_ORDERS.items():
+            current_price, _ = self.fetch_raw_price(ticker)
+            rows.append(GttPriceRow(
+                ticker=ticker,
+                current_price=current_price,
+                trigger_price=config["gtt"],
+                target_price=config["target"],
+            ))
+        return rows
+
+
+# ── Report renderer ───────────────────────────────────────────────────────────
+
+class LivePriceReport:
+    """Renders holding and GTT price data as a Markdown report."""
+
+    def generate(
+        self,
+        holding_rows: list[HoldingPriceRow],
+        gtt_rows: list[GttPriceRow],
+        generated_at: datetime,
+    ) -> str:
+        timestamp_header = (
+            f"# Live NSE Prices — Fetched: {generated_at.strftime('%Y-%m-%d %H:%M IST')}"
+        )
+        sections = [
+            timestamp_header,
+            self._render_holdings_table(holding_rows),
+            self._render_portfolio_summary(holding_rows),
+            self._render_gtt_table(gtt_rows),
+        ]
+        return "\n\n".join(sections)
+
+    def _render_holdings_table(self, rows: list[HoldingPriceRow]) -> str:
+        header_lines = [
+            "## Active Holdings",
+            "",
+            "| Ticker | CMP (₹) | Prev Close (₹) | Day Chg% | Cost (₹) | P&L% |"
+            " SL (₹) | SL Buffer% | Target (₹) | Upside% |",
+            "|--------|---------|----------------|----------|----------|------|"
+            "--------|------------|------------|---------|",
+        ]
+        data_lines = [self._format_holding_row(row) for row in rows]
+        return "\n".join(header_lines + data_lines)
+
+    def _format_holding_row(self, row: HoldingPriceRow) -> str:
+        target_label = f"{row.target_price:,.2f}" if row.target_price is not None else "TBD"
+        if row.current_price is None:
+            return (
+                f"| {row.ticker} | N/A | N/A | N/A | {row.average_cost:,.2f} | "
+                f"N/A | {row.stop_loss_price:,.2f} | N/A | {target_label} | N/A |"
+            )
+        prev_close_label  = f"{row.previous_close:,.2f}" if row.previous_close is not None else "N/A"
+        day_change_label  = f"{row.day_change_pct:+.2f}%" if row.day_change_pct is not None else "N/A"
+        upside_label      = f"{row.upside_to_target_pct:+.2f}%" if row.upside_to_target_pct is not None else "TBD"
+        return (
+            f"| {row.ticker} | {row.current_price:,.2f} | {prev_close_label} | {day_change_label} | "
+            f"{row.average_cost:,.2f} | {row.profit_loss_pct:+.2f}% | {row.stop_loss_price:,.2f} | "
+            f"{row.stop_loss_buffer_pct:+.2f}% | {target_label} | {upside_label} |"
+        )
+
+    def _render_portfolio_summary(self, rows: list[HoldingPriceRow]) -> str:
+        total_book_value   = sum(row.book_value for row in rows)
+        total_market_value = sum(
+            row.market_value for row in rows if row.market_value is not None
+        )
+        if total_book_value > 0:
+            unrealised_pnl_pct = (total_market_value - total_book_value) / total_book_value * 100
+            pnl_label = f"{unrealised_pnl_pct:+.2f}%"
+        else:
+            pnl_label = "N/A"
+        return (
+            f"**Portfolio Total Cost:** ₹ {total_book_value:,.2f}  \n"
+            f"**Portfolio Current Value:** ₹ {total_market_value:,.2f}  \n"
+            f"**Unrealised P&L:** {pnl_label}"
+        )
+
+    def _render_gtt_table(self, rows: list[GttPriceRow]) -> str:
+        header_lines = [
+            "## Pending GTT Orders",
+            "",
+            "| Ticker | CMP (₹) | GTT Level (₹) | Distance% | Target (₹) | Upside from GTT% |",
+            "|--------|---------|---------------|-----------|------------|-----------------|",
+        ]
+        data_lines = [self._format_gtt_row(row) for row in rows]
+        return "\n".join(header_lines + data_lines)
+
+    def _format_gtt_row(self, row: GttPriceRow) -> str:
+        if row.current_price is None:
+            return (
+                f"| {row.ticker} | N/A | {row.trigger_price:,.2f} | "
+                f"N/A | {row.target_price:,.2f} | N/A |"
+            )
+        distance_pct        = row.distance_to_trigger_pct
+        upside_from_trigger = row.upside_from_trigger_pct
+        proximity_flag = ""
+        if distance_pct is not None:
+            if distance_pct <= 0:
+                proximity_flag = " [AT/BELOW GTT — CHECK]"
+            elif distance_pct <= 3:
+                proximity_flag = " [APPROACHING]"
+        distance_label = f"{distance_pct:+.2f}%{proximity_flag}" if distance_pct is not None else "N/A"
+        return (
+            f"| {row.ticker} | {row.current_price:,.2f} | {row.trigger_price:,.2f} | "
+            f"{distance_label} | {row.target_price:,.2f} | {upside_from_trigger:+.2f}% |"
+        )
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    fetcher = NsePriceFetcher()
+    holding_rows = fetcher.build_holding_price_rows()
+    gtt_rows     = fetcher.build_gtt_price_rows()
+
+    report_content = LivePriceReport().generate(
+        holding_rows=holding_rows,
+        gtt_rows=gtt_rows,
+        generated_at=datetime.now(),
     )
 
-total_pnl_pct = pct(total_current_value, total_cost_value)
-lines.append(f"\n**Portfolio Total Cost:** Rs {total_cost_value:,.2f}")
-lines.append(f"**Portfolio Current Value:** Rs {total_current_value:,.2f}")
-pnl_str = f"{total_pnl_pct:+.2f}%" if total_pnl_pct is not None else "N/A"
-lines.append(f"**Unrealised P&L:** {pnl_str}\n")
+    OUTPUT_FILE.write_text(report_content, encoding="utf-8")
+    logger.info("Written to %s", OUTPUT_FILE)
+    print(report_content)
 
-lines.append("## Pending GTT Orders\n")
-lines.append("| Ticker | CMP (Rs) | GTT Level (Rs) | Distance% | Target (Rs) | Upside from GTT% |")
-lines.append("|--------|----------|----------------|-----------|-------------|-----------------|")
 
-for ticker, g in GTT_ORDERS.items():
-    cmp, prev = fetch_price(f"{ticker}.NS")
-    if cmp is None:
-        lines.append(f"| {ticker} | N/A | {g['gtt']:,.2f} | N/A | {g['target']:,.2f} | N/A |")
-        continue
-    dist = pct(cmp, g["gtt"])
-    upside_from_gtt = pct(g["target"], g["gtt"])
-    flag = ""
-    if dist is not None:
-        if dist <= 0:
-            flag = " [AT/BELOW GTT - CHECK]"
-        elif dist <= 3:
-            flag = " [APPROACHING]"
-    dist_str = f"{dist:+.2f}%{flag}" if dist is not None else "N/A"
-    lines.append(
-        f"| {ticker} | {cmp:,.2f} | {g['gtt']:,.2f} | {dist_str} | "
-        f"{g['target']:,.2f} | {upside_from_gtt:+.2f}% |"
-    )
-
-output = "\n".join(lines)
-with open("references/live-prices.md", "w") as f:
-    f.write(output)
-print("Written to references/live-prices.md")
-print(output)
+if __name__ == "__main__":
+    main()
