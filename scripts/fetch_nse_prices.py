@@ -20,14 +20,13 @@ NSE_TICKER_SUFFIX = ".NS"
 # update_portfolio.py via AST. Do not rename HOLDINGS / GTT_ORDERS or their keys.
 
 HOLDINGS = {
-    "APTUS":      {"qty": 310, "cost": 294.70,   "sl": 280.00,   "target": 350.00},
-    "APARINDS":   {"qty": 4,   "cost": 14838.00, "sl": 14154.00, "target": 18000.00},
-    "KIRLOSENG":  {"qty": 25,  "cost": 2349.88,  "sl": 2290.00,  "target": 3100.00},
-    "AEGISLOG":   {"qty": 40,  "cost": 1002.55,  "sl": 1190.00,  "target": 1350.00},
-    "CUMMINSIND": {"qty": 9,   "cost": 5660.83,  "sl": 5472.00,  "target": 7300.00},
-    "NAVINFLUOR": {"qty": 6,   "cost": 7510.00,  "sl": 7103.00,  "target": 9250.00},
-    "WELCORP":    {"qty": 30,  "cost": 1491.70,  "sl": 1350.00,  "target": None},
-    "CGPOWER":    {"qty": 50,  "cost": 898.46,   "sl": 880.00,   "target": 1120.00},
+    "APTUS":      {"qty": 310, "cost": 294.70, "sl": 280.00, "target": 350.00},
+    "KIRLOSENG":  {"qty": 25, "cost": 2349.88, "sl": 2290.00, "target": 3100.00},
+    "AEGISLOG":   {"qty": 40, "cost": 1002.55, "sl": 1190.00, "target": 1350.00},
+    "CUMMINSIND": {"qty": 9, "cost": 5660.83, "sl": 5472.00, "target": 7300.00},
+    "NAVINFLUOR": {"qty": 6, "cost": 7510.00, "sl": 7103.00, "target": 9250.00},
+    "WELCORP":    {"qty": 30, "cost": 1491.70, "sl": 1350.00, "target": None},
+    "CGPOWER":    {"qty": 50, "cost": 898.46, "sl": 880.00, "target": 1120.00},
 }
 
 GTT_ORDERS = {
