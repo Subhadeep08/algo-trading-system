@@ -1,4 +1,4 @@
-# Portfolio Data — Last Updated: July 6, 2026
+# Portfolio Data — Last Updated: July 06, 2026
 
 Update this file whenever holdings, stop-losses, GTT levels, or targets change.
 
@@ -6,7 +6,7 @@ Update this file whenever holdings, stop-losses, GTT levels, or targets change.
 
 | Ticker (NSE)       | Qty | Cost Price (₹) | Trailing Stop-Loss (₹) | Target Price (₹) | Key Catalyst |
 |---------------------|-----|-----------------|-------------------------|-------------------|--------------|
-| APTUS               | 100 |          294.70 |                  280.00 |            350.00 | Citi positive watch; 34% YoY disbursement growth — partial exit (210 shares sold) |
+| APTUS               | 100 |          294.70 |                  285.00 |            350.00 | Citi positive watch; 34% YoY disbursement growth — partial exit (210 shares sold) |
 | APARINDS            | 4   |       14,838.00 |               13,678.00 |         18,000.00 | Saudi Aramco Base Oil JV; National Electricity Plan capex — GTT SELL trigger ₹13,678 active |
 | KIRLOSENG           | 25  |        2,349.88 |                2,183.00 |          3,100.00 | 192 MW HyperNext order; data center monopoly crack — GTT SELL trigger ₹2,183 / limit ₹2,200 set Jul 6 |
 | AEGISLOG            | 40  |        1,002.55 |                1,340.00 |          1,350.00 | Record Liquid Logistics EBITDA; Royal Vopak JV — GTT SELL trigger ₹1,340 / limit ₹1,380; CMP above target ₹1,350 — review target |
@@ -21,6 +21,7 @@ Update this file whenever holdings, stop-losses, GTT levels, or targets change.
 
 | Ticker (NSE)       | Qty | GTT Limit (₹) | Target Price (₹) | Key Catalyst |
 |---------------------|-----|----------------|-------------------|--------------|
+
 | SYRMA               | 30  |       1,275.00 |          1,600.00 | PAT +87% FY26; Kaga Electronics Japan JV |
 
 ## Exited Positions (for reference — do not track daily)
