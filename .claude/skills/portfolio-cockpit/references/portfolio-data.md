@@ -8,7 +8,7 @@ Update this file whenever holdings, stop-losses, GTT levels, or targets change.
 |---------------------|-----|-----------------|-------------------------|-------------------|--------------|
 | APTUS               | 100 |          294.70 |                  280.00 |            350.00 | Citi positive watch; 34% YoY disbursement growth — partial exit (210 shares sold) |
 | APARINDS            | 4   |       14,838.00 |               13,678.00 |         18,000.00 | Saudi Aramco Base Oil JV; National Electricity Plan capex — GTT SELL trigger ₹13,678 active |
-| KIRLOSENG           | 25  |        2,349.88 |                2,290.00 |          3,100.00 | 192 MW HyperNext order; data center monopoly crack — ⚠️ CMP ₹2,265 BELOW SL ₹2,290; no GTT protection |
+| KIRLOSENG           | 25  |        2,349.88 |                2,183.00 |          3,100.00 | 192 MW HyperNext order; data center monopoly crack — GTT SELL trigger ₹2,183 / limit ₹2,200 set Jul 6 |
 | AEGISLOG            | 40  |        1,002.55 |                1,300.00 |          1,350.00 | Record Liquid Logistics EBITDA; Royal Vopak JV — ⚠️ CMP ₹1,409 ABOVE TARGET ₹1,350; SL ratcheted to ₹1,300 |
 | CUMMINSIND          | 9   |        5,660.83 |                5,472.00 |          7,300.00 | Data center backup power demand; above 20/50 EMA — ⚠️ No GTT SELL order set; thin SL buffer |
 | NAVINFLUOR          | 6   |        7,510.00 |                7,103.00 |          9,250.00 | Specialty fluorochemicals; R-32 refrigerant + CDMO pipeline |
