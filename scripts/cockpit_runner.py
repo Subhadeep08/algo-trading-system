@@ -58,8 +58,8 @@ HOLDINGS = {
     "NAVINFLUOR": {"qty": 6,   "cost": 7510.00,  "sl": 7103.00,  "target": 9250.00},
     "WELCORP":    {"qty": 30,  "cost": 1491.70,  "sl": 1350.00,  "target": None},
     "CGPOWER":    {"qty": 50,  "cost": 898.46,   "sl": 880.00,   "target": 1120.00},
-    "GETL":       {"qty": 7,   "cost": 4536.57,  "sl": 4300.00,  "target": None},
-    "TRIL":       {"qty": 58,  "cost": 343.85,   "sl": 323.00,   "target": None},
+    "GVT&D":      {"qty": 7,   "cost": 4536.57,  "sl": 4300.00,  "target": None},
+    "TARIL":      {"qty": 58,  "cost": 343.85,   "sl": 323.00,   "target": None},
 }
 
 GTT_ORDERS = {

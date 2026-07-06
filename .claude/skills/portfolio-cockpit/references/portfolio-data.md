@@ -14,8 +14,8 @@ Update this file whenever holdings, stop-losses, GTT levels, or targets change.
 | NAVINFLUOR          | 6   |        7,510.00 |                7,103.00 |          9,250.00 | Specialty fluorochemicals; R-32 refrigerant + CDMO pipeline |
 | WELCORP             | 30  |        1,491.70 |                1,350.00 |               TBD | SL lowered ₹1,423 → ₹1,350 on Jul 3 |
 | CGPOWER             | 50  |          898.46 |                  880.00 |          1,120.00 | GTT BUY executed Jul 3 at avg ₹898.46; Switchgear/transformer capacity; semiconductor OSAT pilot Sanand |
-| GETL                | 7   |        4,536.57 |                4,300.00 |               TBD | GE Vernova T&D India; power grid infrastructure |
-| TRIL                | 58  |          343.85 |                  323.00 |               TBD | Transformers & Rectifiers India; power sector capex cycle |
+| GVT&D               | 7   |        4,536.57 |                4,300.00 |               TBD | GE Vernova T&D India; power grid infrastructure |
+| TARIL               | 58  |          343.85 |                  323.00 |               TBD | Transformers & Rectifiers India; power sector capex cycle |
 
 ## Pending GTT Limit Buys
 
