@@ -50,7 +50,7 @@ NIFTY_50_SYMBOL                  = "^NSEI"
 # update_portfolio.py via AST. Do not rename HOLDINGS / GTT_ORDERS or their keys.
 
 HOLDINGS = {
-    "APTUS":      {"qty": 100, "cost": 294.70,   "sl": 280.00,   "target": 350.00},
+    "APTUS":      {"qty": 100, "cost": 294.70,   "sl": 285.00,   "target": 350.00},
     "APARINDS":   {"qty": 4,   "cost": 14838.00, "sl": 13678.00, "target": 18000.00},
     "KIRLOSENG":  {"qty": 25,  "cost": 2349.88,  "sl": 2183.00,  "target": 3100.00},
     "AEGISLOG":   {"qty": 40,  "cost": 1002.55,  "sl": 1340.00,  "target": 1350.00},
