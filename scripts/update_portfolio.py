@@ -106,13 +106,22 @@ def _format_gtt_orders_as_source_block(gtt_orders: dict) -> str:
         column_padding = " " * (ticker_column_width - len(ticker_symbol))
         rows.append(
             f'    "{ticker_symbol}":{column_padding}'
-            f'{{"gtt": {order_data["gtt"]:.2f}, "target": {order_data["target"]:.2f}}},'
+            f'{{"qty": {order_data["qty"]}, "gtt": {order_data["gtt"]:.2f}, "target": {order_data["target"]:.2f}}},'
         )
     rows.append("}")
     return "\n".join(rows)
 
 
 # ── Markdown writer ───────────────────────────────────────────────────────────
+
+def _extract_exited_positions_section() -> str:
+    """Return the raw text of the Exited Positions section from the existing markdown, or ''."""
+    if not PORTFOLIO_MD.exists():
+        return ""
+    content = PORTFOLIO_MD.read_text(encoding="utf-8")
+    match = re.search(r"(## Exited Positions.*?)(?=\n## |\Z)", content, re.DOTALL)
+    return match.group(1).rstrip() if match else ""
+
 
 def _write_portfolio_markdown(
     holdings: dict,
@@ -147,15 +156,19 @@ def _write_portfolio_markdown(
         "",
         "## Pending GTT Limit Buys",
         "",
-        "| Ticker (NSE)       | GTT Limit (₹) | Target Price (₹) | Key Catalyst |",
-        "|---------------------|----------------|-------------------|--------------|",
+        "| Ticker (NSE)       | Qty | GTT Limit (₹) | Target Price (₹) | Key Catalyst |",
+        "|---------------------|-----|----------------|-------------------|--------------|\n",
     ]
     for ticker_symbol, order_data in gtt_orders.items():
         catalyst_text = catalyst_notes.get(f"GTT_{ticker_symbol}", "")
         lines.append(
-            f"| {ticker_symbol:<20}| {order_data['gtt']:>14,.2f} "
+            f"| {ticker_symbol:<20}| {order_data['qty']:<4}"
+            f"| {order_data['gtt']:>14,.2f} "
             f"| {order_data['target']:>17,.2f} | {catalyst_text} |"
         )
+    exited_section = _extract_exited_positions_section()
+    if exited_section:
+        lines += ["", exited_section]
     lines += [
         "",
         "## Benchmark Indices",
@@ -177,19 +190,28 @@ def _write_portfolio_markdown(
 # ── Catalyst notes extractor ──────────────────────────────────────────────────
 
 def _load_catalyst_notes_from_markdown() -> dict[str, str]:
-    """Parse the Key Catalyst column from portfolio-data.md, keyed by ticker symbol."""
+    """Parse the Key Catalyst column from portfolio-data.md, keyed by ticker symbol.
+
+    GTT rows are stored with a 'GTT_' prefix so _write_portfolio_markdown can
+    look them up correctly via catalyst_notes.get(f'GTT_{ticker}').
+    """
     catalyst_notes: dict[str, str] = {}
     if not PORTFOLIO_MD.exists():
         return catalyst_notes
+    current_section = ""
     for raw_line in PORTFOLIO_MD.read_text(encoding="utf-8").splitlines():
+        if raw_line.startswith("## "):
+            current_section = raw_line.strip()
+            continue
         if not raw_line.startswith("|") or "Ticker" in raw_line or "---" in raw_line:
             continue
         table_columns = [col.strip() for col in raw_line.strip().strip("|").split("|")]
-        if len(table_columns) >= 5:
+        if len(table_columns) >= 4:
             ticker_symbol = table_columns[0].strip()
             catalyst_text = table_columns[-1].strip()
             if catalyst_text:
-                catalyst_notes[ticker_symbol] = catalyst_text
+                key = f"GTT_{ticker_symbol}" if "GTT" in current_section else ticker_symbol
+                catalyst_notes[key] = catalyst_text
     return catalyst_notes
 
 
@@ -275,15 +297,16 @@ def _execute_update_stop_loss(
 def _execute_add_gtt_order(
     gtt_orders: dict,
     ticker_symbol: str,
+    share_count: int,
     trigger_price: float,
     target_price: float,
     catalyst_text: str,
     catalyst_notes: dict[str, str],
 ) -> None:
-    gtt_orders[ticker_symbol] = {"gtt": trigger_price, "target": target_price}
+    gtt_orders[ticker_symbol] = {"qty": share_count, "gtt": trigger_price, "target": target_price}
     if catalyst_text:
         catalyst_notes[f"GTT_{ticker_symbol}"] = catalyst_text
-    print(f"  GTT added {ticker_symbol}: trigger ₹{trigger_price} | Target ₹{target_price}")
+    print(f"  GTT added {ticker_symbol}: {share_count} shares | trigger ₹{trigger_price} | Target ₹{target_price}")
 
 
 def _execute_remove_gtt_order(
@@ -334,7 +357,7 @@ def main() -> None:
         _execute_update_stop_loss(holdings, args.ticker, args.sl)
     elif args.action == "add_gtt":
         _execute_add_gtt_order(
-            gtt_orders, args.ticker, args.price, args.target, args.catalyst, catalyst_notes
+            gtt_orders, args.ticker, int(args.qty), args.price, args.target, args.catalyst, catalyst_notes
         )
     elif args.action == "remove_gtt":
         _execute_remove_gtt_order(gtt_orders, args.ticker, catalyst_notes)
