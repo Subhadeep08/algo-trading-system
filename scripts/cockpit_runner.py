@@ -19,6 +19,14 @@ import pytz
 import requests
 import yfinance as yf
 
+# screen_candidates.py lives in the same scripts/ directory.
+# The import succeeds when run via GitHub Actions or directly via `python scripts/...`.
+try:
+    from screen_candidates import Stage2Checker, UDRatioCalculator
+    _PMS_GATES_AVAILABLE = True
+except ImportError:
+    _PMS_GATES_AVAILABLE = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -43,6 +51,22 @@ TELEGRAM_MESSAGE_CHAR_LIMIT      = 4000
 VOLUME_LOOKBACK_PERIOD           = "21d"  # ~1 calendar month of trading sessions
 NSE_TICKER_SUFFIX                = ".NS"
 NIFTY_50_SYMBOL                  = "^NSEI"
+
+# ── PMS screening thresholds — imported by HoldingRequalifier ────────────────
+UD_ENTRY_THRESHOLD          = 1.25   # Gate 2 pass threshold
+UD_DISTRIBUTION_THRESHOLD   = 0.75   # Gate 2 disqualify / U/D_21 flag
+UD_LOOKBACK_50              = 50     # sessions for long-term U/D ratio
+UD_LOOKBACK_21              = 21     # sessions for near-term U/D ratio
+STAGE2_MA_PERIOD            = 150    # days (≈ 30-week Weinstein MA)
+EBITDA_CFO_MIN_RATIO        = 0.85
+QUARTERLY_EPS_GROWTH_MIN    = 25.0   # %
+ANNUAL_PROFIT_GROWTH_MIN    = 20.0   # %
+ROCE_MIN_PCT                = 15.0
+DE_RATIO_MAX                = 0.5
+PE_STRESS_RETRACEMENT_MAX   = 0.20   # within 20% of 52-week high
+RISK_PER_TRADE_PCT          = 0.02   # 2% of portfolio capital
+MAX_POSITION_PCT            = 0.20   # 20% per holding
+SL_BELOW_ENTRY_PCT          = 0.09   # 9% default GTT SL below entry
 
 
 # ── Portfolio registry ────────────────────────────────────────────────────────
@@ -294,6 +318,86 @@ class TelegramNotifier:
         return delivered
 
 
+# ── PMS Holding Re-Qualifier ──────────────────────────────────────────────────
+
+class HoldingRequalifier:
+    """
+    Runs Stage 2 (Gate 1) and U/D Volume Ratio (Gate 2) on all active holdings.
+    Produces a formatted re-qualification table for Phase 3D.
+    Falls back gracefully when screen_candidates.py is not importable.
+    """
+
+    def build_section(
+        self,
+        holding_snapshots: dict[str, Optional["HoldingSnapshot"]],
+    ) -> str:
+        if not _PMS_GATES_AVAILABLE:
+            return (
+                "🔬 HOLDING RE-QUALIFICATION\n"
+                "screen_candidates.py not found — skipping PMS gates"
+            )
+
+        stage2_checker = Stage2Checker()
+        ud_calculator  = UDRatioCalculator()
+        rows: list[str] = []
+        action_items: list[str] = []
+
+        for ticker in holding_snapshots:
+            try:
+                g1 = stage2_checker.check(ticker)
+                g2 = ud_calculator.calculate(ticker)
+                status, flag = self._classify(g1, g2, ticker)
+                ma_str = f"₹{g1.ma_150:.0f}" if g1.ma_150 else "N/A"
+                ud50   = f"{g2.ud_50:.2f}" if g2.ud_50 else "N/A"
+                ud21   = f"{g2.ud_21:.2f}" if g2.ud_21 else "N/A"
+                rows.append(
+                    f"{ticker:<12} | {g1.stage_label:<25} | MA150:{ma_str} "
+                    f"| U/D50:{ud50} | U/D21:{ud21} | {status}"
+                )
+                if flag:
+                    action_items.append(flag)
+            except Exception as exc:
+                rows.append(f"{ticker:<12} | ERROR: {exc}")
+
+        body = "\n".join(rows) if rows else "No data"
+        return "🔬 HOLDING RE-QUALIFICATION (PMS Technical Gates)\n" + body
+
+    @staticmethod
+    def _classify(g1, g2, ticker: str) -> tuple[str, str]:
+        """Returns (status_label, optional_action_item)."""
+        # Stage 3/4 → thesis violation
+        if not g1.passed and ("Stage 3" in g1.stage_label or "Stage 4" in g1.stage_label or "Declining" in g1.stage_label):
+            return (
+                "🔴 PMS THESIS VIOLATION — review exit",
+                f"PMS ALERT {ticker}: {g1.stage_label} — exit independent of SL",
+            )
+        # Stage 2 warning
+        if not g1.passed and "Warning" in g1.stage_label:
+            return (
+                "⚠️ Stage 2 Warning — tighten SL",
+                f"WATCH {ticker}: MA150 flattening — tighten trailing SL",
+            )
+        # Stage 1 (basing)
+        if not g1.passed:
+            return ("⚠️ Stage 1 (Basing) — below MA150", "")
+
+        # Gate 2 checks
+        if g2.disqualified:
+            return (
+                "🔴 DISTRIBUTION DISQUALIFY — institutional exit detected",
+                f"PMS ALERT {ticker}: U/D_50={g2.ud_50:.2f} — institutional selling; review urgently",
+            )
+        if g2.distribution_flag:
+            return (
+                "⚠️ Near-term distribution signal — monitor SL",
+                f"WATCH {ticker}: U/D_21={g2.ud_21:.2f} distribution — SL watch",
+            )
+        if not g2.passed:
+            return ("⚪ Weak accumulation — no new capital", "")
+
+        return ("✅ CONFIRMED ACCUMULATION", "")
+
+
 # ── Report builder ────────────────────────────────────────────────────────────
 
 class CockpitReportBuilder:
@@ -448,6 +552,8 @@ class CockpitReportBuilder:
             action_items, empty_message="CLEAN — Portfolio running clean"
         )
 
+        requalification_section = HoldingRequalifier().build_section(holding_snapshots)
+
         sections = [
             f"📊 PHASE 3 POST-MARKET AUDIT | {date_label} 15:35 IST",
             (
@@ -455,8 +561,9 @@ class CockpitReportBuilder:
                 + ("\n".join(all_sl_rows) or "No data available")
             ),
             f"📐 TRAILING SL RATCHET\n" + ("\n".join(ratchet_suggestions) or "None — all SLs current"),
-            f"💰 PORTFOLIO CLOSE\nTotal: ₹{total_market_value:,.0f} | P&L: {portfolio_pnl_pct:+.1f}%",
             f"🛑 STAY-PUT REMINDERS\n" + ("\n".join(stay_put_reminders) or "None"),
+            requalification_section,
+            f"💰 PORTFOLIO CLOSE\nTotal: ₹{total_market_value:,.0f} | P&L: {portfolio_pnl_pct:+.1f}%",
             f"✅ ACTION ITEMS\n{action_block}",
         ]
         return "\n\n".join(sections)
