@@ -55,6 +55,15 @@ Read `references/telegram-config.md` to get the bot token and chat ID.
 You will use the sendMessage endpoint at the end of each phase to push the report
 directly to the user's Telegram.
 
+### 0D — Read PMS Screening Data (for Phase 3D and Phase 5)
+
+Read both files:
+- `references/pms-screening-spec.md` — all gate thresholds, formulas, and the 24-parameter checklist
+- `references/watchlist.md` — PMS candidates under screening and their latest gate scores
+
+These files are required for Phase 3D (holding re-qualification) and Phase 5 (watchlist screening).
+Skip if the user only requests Phase 1, 2, or 3 without re-qualification.
+
 ---
 
 ## Step 1 — Determine Which Phase to Run
@@ -268,6 +277,42 @@ Send via the same WebFetch pattern as Phase 1, using telegram-config.md.
 
 ---
 
+## Phase 3D: Holding Re-Qualification (PMS Technical Gates)
+
+Run this after Phase 3 or when the user asks for "holding re-qualification" or "PMS check".
+This checks whether existing holdings still qualify under Weinstein Stage 2 and volume accumulation criteria.
+Thresholds and formulas are in `references/pms-screening-spec.md`.
+
+### 3D-1 — Stage 2 Status (Gate 1)
+
+For each active holding, using CMP from `references/live-prices.md`:
+- Web-search: `TICKER NSE 150 day moving average` or `TICKER NSE stage analysis trendlyne` if MA data is not in live-prices.md
+- Classify: Stage 2 (CMP > MA150, MA upsloping) / Stage 2 Warning (MA flattening) / Stage 3 (price below MA)
+- If Stage 3 or Stage 4: flag as **"PMS THESIS VIOLATION — consider exit independent of SL level"**
+
+### 3D-2 — U/D Volume Ratio Signal (Gate 2)
+
+For each holding, from Phase 2 volume data or web-search `TICKER NSE volume accumulation distribution`:
+- Estimate whether recent sessions show up-day volume dominance (accumulation) or down-day dominance (distribution)
+- Flag if distribution is confirmed: **"DISTRIBUTION SIGNAL — institutional selling; tighten SL"**
+
+### 3D-3 — Re-Qualification Table
+
+Present:
+
+```
+HOLDING RE-QUALIFICATION (PMS Technical Gates)
+TICKER    | Stage                     | MA150   | U/D_50 | U/D_21 | Status
+AEGISLOG  | Stage 2 Warning           | ₹1,342  | 0.91   | 0.68   | ⚠️ DISTRIBUTION — REVIEW THESIS
+NAVINFLUOR| Stage 2 (Advancing)       | ₹7,190  | 1.41   | 1.52   | ✅ CONFIRMED ACCUMULATION
+...
+```
+
+If MA data is unavailable via web search, mark as "Manual Check — verify on Trendlyne".
+The automated cockpit runner (cockpit_runner.py Phase 3) computes this table from yfinance data.
+
+---
+
 ## Phase 4: Capital Allocation Rules Check
 
 Run these after whichever phase was selected.
@@ -295,6 +340,69 @@ Remind the user:
 > "Do not track daily ticks on exited positions (JSW Energy or others). Asset-heavy
 > power producers lack the operating leverage of your current electrical equipment,
 > high-horsepower backup, and specialty chemicals plays. Move forward."
+
+---
+
+## Phase 5: Watchlist Screening (Post-Market, On-Demand)
+
+Run this when the user asks for "watchlist screen", "PMS screen", "Phase 5", or "screen new candidates".
+Thresholds and the 24-parameter checklist are in `references/pms-screening-spec.md`.
+The candidate list is in `references/watchlist.md`.
+
+### 5A — Gate 1: Stage 2 Check (per candidate)
+
+For each ticker in watchlist.md:
+- Web-search: `TICKER NSE 150 day moving average site:trendlyne.com` OR `TICKER NSE screener stage analysis`
+- Report: CMP vs MA150, MA slope direction
+- Pass if CMP > MA150 and MA upsloping; fail otherwise
+
+### 5B — Gate 2: Volume Accumulation Proxy (per candidate)
+
+For each Gate 1 passer:
+- Web-search: `TICKER NSE volume analysis bulk deals institutional` or `TICKER NSE accumulation distribution`
+- Estimate U/D character from recent price action and volume commentary
+- Mark as ACCUMULATION / NEUTRAL / DISTRIBUTION based on available data
+
+### 5C — Gates 3+4: Fundamental Check (per Gate 2 passer)
+
+For each Gate 2 passer:
+- Web-search: `TICKER screener.in quarterly results ROCE debt equity`
+- Check: quarterly EPS growth ≥ 25% YoY, 3-year PAT CAGR ≥ 20%, ROCE ≥ 15%, D/E ≤ 0.5
+- Check: EBITDA-to-CFO ratio ≥ 0.85 (flag as "Manual Verify" if not found in 30 seconds)
+
+### 5D — PE Stress Test (per Gates 3+4 passer)
+
+For each fundamental passer:
+- Get current PE from Screener.in or web-search `TICKER NSE PE ratio TTM forward`
+- Check: CMP within 20% of 52-week high
+- Apply Target PE test if target price is known (from watchlist.md Notes column)
+
+### 5E — Output Ranked Shortlist
+
+Present:
+
+```
+PMS WATCHLIST SCREEN | {DATE}
+Screened: {N} | All-Clear: {X} | Fundamentals Pending: {Y} | Technical Fail: {Z}
+
+ALL-CLEAR (pass all gates):
+TICKER | Gate1 | Gate2 | Fundas | PE | Status | Suggested GTT Entry | Rec. Shares
+...
+
+FUNDAMENTALS PENDING (Gates 1+2 pass, Gate 3/4 needs verify):
+TICKER | Stage | U/D | Pending Fields
+...
+
+TECHNICAL FAIL:
+TICKER | Failed Gate | Reason
+...
+```
+
+For all-clear tickers, apply PositionSizer formula from pms-screening-spec.md:
+- Risk = portfolio_value × 2%
+- Shares = Risk / (CMP − CMP × 0.91)  [9% default SL below entry]
+- Cap at 20% of portfolio
+- Promote to watchlist.md "Ready to Acquire" section
 
 ---
 

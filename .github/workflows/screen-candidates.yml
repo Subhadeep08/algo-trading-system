@@ -1,0 +1,43 @@
+name: PMS Candidate Screener
+
+on:
+  schedule:
+    - cron: '40 10 * * 1-5'   # 16:10 IST (Mon–Fri) — post-market close
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: >
+          Comma-separated NSE tickers for one-off screening (e.g. DIXON,ASTRAL,POLYCAB).
+          Leave blank to screen the full watchlist.md.
+        required: false
+        default: ''
+      portfolio_value:
+        description: >
+          Portfolio value in INR for position sizing (e.g. 425000).
+          Overrides PORTFOLIO_VALUE_INR secret if set.
+        required: false
+        default: ''
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install yfinance requests anthropic pytz
+      - name: Run PMS Candidate Screener
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PORTFOLIO_VALUE_INR: ${{ inputs.portfolio_value || secrets.PORTFOLIO_VALUE_INR || '0' }}
+        run: |
+          TICKERS="${{ inputs.tickers }}"
+          if [ -n "$TICKERS" ]; then
+            python scripts/screen_candidates.py --tickers "$TICKERS" --portfolio-value "$PORTFOLIO_VALUE_INR"
+          else
+            python scripts/screen_candidates.py --portfolio-value "$PORTFOLIO_VALUE_INR"
+          fi
