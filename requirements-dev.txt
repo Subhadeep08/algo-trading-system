@@ -1,0 +1,7 @@
+pytest>=8.0
+numpy
+pandas
+pytz
+yfinance
+requests
+anthropic
