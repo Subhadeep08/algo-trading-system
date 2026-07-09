@@ -41,3 +41,10 @@ jobs:
           else
             python scripts/screen_candidates.py --portfolio-value "$PORTFOLIO_VALUE_INR"
           fi
+      - name: Commit screening results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .claude/skills/portfolio-cockpit/references/screening-results.md
+          git diff --staged --quiet || git commit -m "chore: update PMS screening results $(date '+%Y-%m-%d') [skip ci]"
+          git push

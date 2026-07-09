@@ -1141,44 +1141,40 @@ class CandidateScreener:
 
     def screen(self, ticker: str) -> ScreeningResult:
         result = ScreeningResult(ticker=ticker)
+        failed_gates: list[str] = []
 
-        # Gate 1
+        # Gate 1 — always run
         g1 = self._stage2.check(ticker)
         result.gate1 = g1
         if not g1.passed:
-            result.first_failed_gate = "Gate 1 (Stage 2)"
-            result.recommendation = f"FAIL: {g1.stage_label} — {g1.notes}"
-            return result
+            failed_gates.append(f"Gate 1: {g1.stage_label} — {g1.notes}")
 
-        # Gate 2
+        # Gate 2 — always run (accumulation/distribution matters independently)
         g2 = self._ud.calculate(ticker)
         result.gate2 = g2
         if g2.disqualified:
-            result.first_failed_gate = "Gate 2 (U/D — Distribution)"
-            result.recommendation = f"DISQUALIFY: {g2.notes}"
-            return result
-        if not g2.passed:
-            result.first_failed_gate = "Gate 2 (U/D — Weak)"
-            result.recommendation = f"FAIL: {g2.notes}"
-            return result
+            failed_gates.append(f"Gate 2: DISQUALIFY — {g2.notes}")
+        elif not g2.passed:
+            failed_gates.append(f"Gate 2: WEAK — {g2.notes}")
 
-        # Gates 3 + 4
+        # Gates 3 + 4 — always run for full fundamental picture
         g34 = self._funds.screen(ticker)
         result.gate3_gate4 = g34
         if not g34.passed:
-            result.first_failed_gate = "Gate 3/4 (Fundamentals)"
-            result.recommendation = f"FAIL: {g34.notes}"
-            return result
+            failed_gates.append(f"Gate 3/4: {g34.notes}")
 
-        # PE Stress Test
+        # PE Stress Test — always run
         pe = self._valuation.stress_test(ticker)
         result.pe_stress = pe
         if not pe.passed:
-            result.first_failed_gate = "PE Stress Test"
-            result.recommendation = f"FAIL: {pe.notes}"
+            failed_gates.append(f"PE Test: {pe.notes}")
+
+        if failed_gates:
+            result.first_failed_gate = failed_gates[0]
+            result.recommendation = "FAIL: " + " | ".join(failed_gates)
             return result
 
-        # 24-Parameter Secondary Overlay (advisory, never hard-fails)
+        # All gates passed — run secondary overlay (advisory, never hard-fails)
         result.secondary = self._secondary.run(ticker)
 
         manual_items = g34.manual_verify_fields
@@ -1243,20 +1239,28 @@ class ScreeningRunner:
             return []
 
         tickers: list[str] = []
+        in_candidate_section = False
         in_table = False
         for line in lines:
-            line = line.strip()
-            if line.startswith("| Ticker") or line.startswith("|Ticker"):
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                in_candidate_section = stripped.startswith("## Candidate Tickers")
+                in_table = False
+                continue
+            if not in_candidate_section:
+                continue
+            if stripped.startswith("| Ticker") or stripped.startswith("|Ticker"):
                 in_table = True
                 continue
-            if in_table and line.startswith("|---"):
+            if in_table and stripped.startswith("|---"):
                 continue
-            if in_table and line.startswith("|"):
-                parts = [p.strip() for p in line.split("|")]
+            if in_table and stripped.startswith("|"):
+                parts = [p.strip() for p in stripped.split("|")]
                 parts = [p for p in parts if p]
-                if parts and parts[0] and not parts[0].startswith("-"):
-                    tickers.append(parts[0])
-            elif in_table and not line.startswith("|"):
+                ticker = parts[0] if parts else ""
+                if ticker and not ticker.startswith("-") and ticker != "—":
+                    tickers.append(ticker)
+            elif in_table and not stripped.startswith("|"):
                 in_table = False
         return tickers
 
@@ -1364,7 +1368,7 @@ class ScreeningRunner:
                 f"\nDISTRIBUTION FLAGS: {', '.join(r.ticker for r in flags)}"
             )
 
-        msg_parts.append("\nFull results: references/screening-results.md")
+        msg_parts.append(f"\nFull results: {SCREENING_RESULTS_PATH}")
         message = "\n".join(msg_parts)
 
         url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
