@@ -2,8 +2,8 @@ name: Portfolio Cockpit — Phase 2 Mid-Market
 
 on:
   schedule:
-    - cron: '0 8 * * 1-5'    # 13:30 IST (Mon–Fri)
-  workflow_dispatch:           # allow manual trigger from GitHub UI
+    - cron: '0 8 * * 1-5'
+  workflow_dispatch:
 
 jobs:
   phase2:
@@ -14,10 +14,10 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install dependencies
-        run: pip install yfinance requests anthropic pytz
-      - name: Run Phase 2 Mid-Market Relative Strength
+        run: pip install -r requirements.txt
+      - name: Run Phase 2
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python scripts/cockpit_runner.py --phase 2
+        run: python scripts/run_cockpit.py --phase 2
