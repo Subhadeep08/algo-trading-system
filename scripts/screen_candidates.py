@@ -1,12 +1,16 @@
 """
 PMS quantitative screening pipeline for NSE stocks.
 
-Runs 4 sequential gates:
+Runs 4 sequential hard gates + PE stress test:
   Gate 1  — Stan Weinstein Stage 2 (150-day MA trend)
   Gate 2  — Up/Down Volume Ratio (institutional accumulation vs distribution)
   Gate 3  — EBITDA-to-CFO cash conversion quality (≥ 0.85)
   Gate 4  — CANSLIM fundamentals (EPS growth, PAT CAGR, ROCE, D/E)
-  PE Test — Forward PE stress test + 52-week retracement check
+  PE Test — 52-week retracement ≤ 10% (confirms active markup phase)
+
+After all gates pass, runs the 24-parameter secondary valuation overlay
+across 6 categories: Valuation, Margin Consistency, Cash Flow Quality,
+Asset Allocation, Compound Growth, and Technical Retracement.
 
 Used standalone (GitHub Actions) and imported by cockpit_runner.py for holding re-qualification.
 """
@@ -46,12 +50,59 @@ QUARTERLY_REV_GROWTH_MIN    = 25.0   # Gate 4-C: min QoQ revenue growth %
 ANNUAL_PROFIT_GROWTH_MIN    = 20.0   # Gate 4-A: min 3-year PAT CAGR %
 ROCE_MIN_PCT                = 15.0   # Gate 4: min ROCE %
 DE_RATIO_MAX                = 0.5    # Gate 4: max Debt/Equity ratio
-PE_STRESS_RETRACEMENT_MAX   = 0.20   # PE test: CMP must be within 20% of 52W high
+PE_STRESS_RETRACEMENT_MAX   = 0.10   # PE test: CMP must be within 10% of 52W high
 RISK_PER_TRADE_PCT          = 0.02   # 2% of portfolio capital at risk per trade
 MAX_POSITION_PCT            = 0.20   # 20% cap per holding
 SL_BELOW_ENTRY_PCT          = 0.09   # 9% default SL below entry price
 
+# ── 24-Parameter Secondary Overlay Thresholds ────────────────────────────────
+# Category 1: Valuation & Pricing
+TRAILING_PE_MAX             = 45.0   # <45x (unless EPS growth >40%)
+FORWARD_PE_MAX              = 30.0   # <30x
+EV_EBITDA_MAX               = 25.0   # <25x
+PB_RATIO_MAX                = 6.0    # <6x
+PEG_RATIO_MAX               = 1.2    # ≤1.2
+
+# Category 2: Margin Consistency
+GROSS_MARGIN_VAR_MAX_BPS    = 150    # <±150 bps std over 12 quarters
+NET_MARGIN_MIN_PCT          = 12.0   # >12%
+OTHER_INCOME_PBT_MAX        = 0.10   # ≤10%
+
+# Category 3: Cash Flow Quality
+FCF_SALES_MIN_PCT           = 8.0    # ≥8%
+FCF_YIELD_MIN_PCT           = 3.0    # ≥3%
+CFO_NET_PROFIT_MIN          = 1.0    # ≥1.0x (3-year rolling)
+DIVIDEND_PAYOUT_MIN         = 0.15   # ≥15% (mature cash generators)
+DIVIDEND_PAYOUT_MAX         = 0.45   # ≤45% (mature cash generators)
+
+# Category 4: Asset Allocation
+ROIC_MIN_PCT                = 18.0   # ≥18%
+ROIC_WACC_SPREAD_MIN_BPS    = 600    # ≥600 bps (manual verify — needs WACC)
+REINVESTMENT_RATE_MIN_PCT   = 50.0   # ≥50% (high-growth names; manual verify)
+ASSET_TURNOVER_MIN          = 1.5    # ≥1.5x
+
+# Category 5: Compound Growth
+REVENUE_CAGR_3Y_MIN_PCT     = 18.0   # ≥18%
+REVENUE_CAGR_5Y_MIN_PCT     = 15.0   # ≥15%
+EBITDA_CAGR_3Y_MIN_PCT      = 22.0   # ≥22%
+
+# Category 6: Technical Retracement
+DIST_52W_HIGH_MAX           = 0.10   # ≤10% below 52W high (same as PE_STRESS_RETRACEMENT_MAX)
+BREAKOUT_VOLUME_MULT        = 1.5    # ≥1.5x 20-day avg vol at ATH breakout
+
+# ── GTT Trailing Stop Slab Table (2026 Groww execution guidelines) ────────────
+GTT_TRAILING_STOP_SLABS: list[tuple[float, float, float]] = [
+    (0,      50,     0.05),
+    (50,     100,    0.10),
+    (100,    250,    0.25),
+    (250,    500,    0.50),
+    (500,    1_000,  1.00),
+    (1_000,  2_500,  2.00),
+    (2_500,  10_000, 5.00),
+]
+
 NSE_SUFFIX                  = ".NS"
+NIFTY_SYMBOL                = "^NSEI"
 SCREENING_RESULTS_PATH      = ".claude/skills/portfolio-cockpit/references/screening-results.md"
 WATCHLIST_PATH              = ".claude/skills/portfolio-cockpit/references/watchlist.md"
 
@@ -120,12 +171,34 @@ class PositionSizeResult:
 
 
 @dataclass
+class OverlayParamResult:
+    name: str
+    category: str
+    value: Optional[float]
+    threshold: str
+    status: str   # "PASS" | "FAIL" | "MANUAL_VERIFY" | "N/A"
+    notes: str = ""
+
+
+@dataclass
+class SecondaryOverlayResult:
+    ticker: str
+    params: list = field(default_factory=list)   # list[OverlayParamResult]
+    pass_count: int = 0
+    fail_count: int = 0
+    manual_count: int = 0
+    na_count: int = 0
+    overall_rating: str = ""   # "STRONG" | "ADEQUATE" | "WEAK"
+
+
+@dataclass
 class ScreeningResult:
     ticker: str
     gate1: Optional[Stage2Result] = None
     gate2: Optional[UDRatioResult] = None
     gate3_gate4: Optional[FundamentalResult] = None
     pe_stress: Optional[PEStressResult] = None
+    secondary: Optional[SecondaryOverlayResult] = None
     passed_all: bool = False
     first_failed_gate: str = ""
     recommendation: str = ""
@@ -480,7 +553,8 @@ class ValuationStressTester:
     Checks:
       (a) Entry PE and Forward PE (informational)
       (b) 52-week retracement: CMP ≥ 52W high × (1 - PE_STRESS_RETRACEMENT_MAX)
-    Pass = within 20% of 52-week high (confirms stock is in markup, not terminal decline).
+    Pass = within 10% of 52-week high (confirms active markup phase; no trapped overhead sellers).
+    Full PE compression stress test (target PE vs 5-year median) flagged for manual verify.
     """
 
     def stress_test(self, ticker: str) -> PEStressResult:
@@ -576,6 +650,478 @@ class PositionSizer:
             notes=notes,
         )
 
+    @staticmethod
+    def compute_trailing_stop_min(price: float) -> float:
+        """Return the minimum trailing-stop increment (₹) for a given price slab."""
+        for lo, hi, tick in GTT_TRAILING_STOP_SLABS:
+            if lo <= price < hi:
+                return tick
+        return GTT_TRAILING_STOP_SLABS[-1][2]
+
+
+# ── 24-Parameter Secondary Valuation Overlay ─────────────────────────────────
+
+class SecondaryOverlayScreener:
+    """
+    Evaluates all 24 institutional parameters across 6 categories.
+    Advisory only — does not hard-fail the pipeline.
+    Flags items as PASS / FAIL / MANUAL_VERIFY / N/A.
+    """
+
+    def run(self, ticker: str) -> SecondaryOverlayResult:
+        ns_ticker = ticker + NSE_SUFFIX
+        t = yf.Ticker(ns_ticker)
+        try:
+            info = t.info
+        except Exception:
+            info = {}
+
+        params: list[OverlayParamResult] = []
+
+        # ── Category 1: Valuation & Pricing ──────────────────────────────────
+        params.append(self._check_scalar(
+            info.get("trailingPE"), "Trailing P/E", "Valuation",
+            f"< {TRAILING_PE_MAX:.0f}x (unless EPS growth >40%)",
+            lambda v: v < TRAILING_PE_MAX,
+        ))
+        params.append(self._check_scalar(
+            info.get("forwardPE"), "Forward P/E", "Valuation",
+            f"< {FORWARD_PE_MAX:.0f}x",
+            lambda v: v < FORWARD_PE_MAX,
+        ))
+        params.append(self._check_scalar(
+            info.get("enterpriseToEbitda"), "EV/EBITDA", "Valuation",
+            f"< {EV_EBITDA_MAX:.0f}x",
+            lambda v: v < EV_EBITDA_MAX,
+        ))
+        params.append(self._check_scalar(
+            info.get("priceToBook"), "P/B Ratio", "Valuation",
+            f"< {PB_RATIO_MAX:.0f}x",
+            lambda v: v < PB_RATIO_MAX,
+        ))
+        params.append(self._check_scalar(
+            info.get("pegRatio"), "PEG Ratio", "Valuation",
+            f"≤ {PEG_RATIO_MAX}",
+            lambda v: v <= PEG_RATIO_MAX,
+        ))
+
+        # ── Category 2: Margin Consistency ───────────────────────────────────
+        gm_var = self._compute_gross_margin_variance(t)
+        params.append(self._check_scalar(
+            gm_var, "Gross Margin Variance (12Q)", "Margins",
+            f"< ±{GROSS_MARGIN_VAR_MAX_BPS} bps std over 12 quarters",
+            lambda v: v < GROSS_MARGIN_VAR_MAX_BPS,
+        ))
+        opm_rising = self._compute_opm_trend(t)
+        params.append(OverlayParamResult(
+            name="OPM Trend (3 FY)", category="Margins",
+            value=None,
+            threshold="Rising over 3 fiscal years",
+            status="PASS" if opm_rising is True else ("FAIL" if opm_rising is False else "MANUAL_VERIFY"),
+            notes="OPM slope positive" if opm_rising else ("OPM declining" if opm_rising is False else "Insufficient data"),
+        ))
+        npm = (info.get("profitMargins") or 0) * 100
+        params.append(self._check_scalar(
+            npm if npm > 0 else None, "Net Margin", "Margins",
+            f"> {NET_MARGIN_MIN_PCT:.0f}%",
+            lambda v: v > NET_MARGIN_MIN_PCT,
+        ))
+        other_pbt = self._compute_other_income_pbt(t)
+        params.append(self._check_scalar(
+            other_pbt, "Other Income / PBT", "Margins",
+            f"≤ {OTHER_INCOME_PBT_MAX * 100:.0f}%",
+            lambda v: v <= OTHER_INCOME_PBT_MAX,
+        ))
+
+        # ── Category 3: Cash Flow Quality ────────────────────────────────────
+        fcf_sales = self._compute_fcf_sales(t, info)
+        params.append(self._check_scalar(
+            fcf_sales, "FCF/Sales", "Cash Flow",
+            f"≥ {FCF_SALES_MIN_PCT:.0f}%",
+            lambda v: v >= FCF_SALES_MIN_PCT,
+        ))
+        mkt_cap  = info.get("marketCap")
+        free_cf  = info.get("freeCashflow")
+        fcf_yield = (free_cf / mkt_cap * 100) if (free_cf and mkt_cap and mkt_cap > 0) else None
+        params.append(self._check_scalar(
+            fcf_yield, "FCF Yield", "Cash Flow",
+            f"≥ {FCF_YIELD_MIN_PCT:.0f}%",
+            lambda v: v >= FCF_YIELD_MIN_PCT,
+        ))
+        cfo_np = self._compute_cfo_net_profit_3y(t)
+        params.append(self._check_scalar(
+            cfo_np, "CFO/Net Profit (3Y avg)", "Cash Flow",
+            f"≥ {CFO_NET_PROFIT_MIN}x",
+            lambda v: v >= CFO_NET_PROFIT_MIN,
+        ))
+        payout = info.get("payoutRatio")
+        if payout is not None and payout > 0:
+            in_range = DIVIDEND_PAYOUT_MIN <= payout <= DIVIDEND_PAYOUT_MAX
+            params.append(OverlayParamResult(
+                name="Dividend Payout Ratio", category="Cash Flow",
+                value=round(payout * 100, 1),
+                threshold=f"{DIVIDEND_PAYOUT_MIN * 100:.0f}–{DIVIDEND_PAYOUT_MAX * 100:.0f}% (mature cash generators)",
+                status="PASS" if in_range else "FAIL",
+                notes=f"{payout * 100:.1f}% — {'in range' if in_range else 'out of range'}",
+            ))
+        else:
+            params.append(OverlayParamResult(
+                name="Dividend Payout Ratio", category="Cash Flow",
+                value=None, threshold="15–45% (mature cash generators)",
+                status="N/A", notes="No dividend or data unavailable — conditional metric",
+            ))
+
+        # ── Category 4: Asset Allocation ─────────────────────────────────────
+        roic = self._compute_roic(t, info)
+        params.append(self._check_scalar(
+            roic, "ROIC", "Asset Alloc",
+            f"≥ {ROIC_MIN_PCT:.0f}%",
+            lambda v: v >= ROIC_MIN_PCT,
+        ))
+        params.append(OverlayParamResult(
+            name="ROIC-WACC Spread", category="Asset Alloc",
+            value=None, threshold=f"≥ {ROIC_WACC_SPREAD_MIN_BPS} bps",
+            status="MANUAL_VERIFY", notes="WACC requires manual CAPM calculation",
+        ))
+        params.append(OverlayParamResult(
+            name="Reinvestment Rate", category="Asset Alloc",
+            value=None, threshold=f"≥ {REINVESTMENT_RATE_MIN_PCT:.0f}% (high-growth names)",
+            status="MANUAL_VERIFY", notes="(CapEx + ΔNWC) / NOPAT — verify on Screener.in",
+        ))
+        at = self._compute_asset_turnover(t)
+        params.append(self._check_scalar(
+            at, "Asset Turnover", "Asset Alloc",
+            f"≥ {ASSET_TURNOVER_MIN}x",
+            lambda v: v >= ASSET_TURNOVER_MIN,
+        ))
+
+        # ── Category 5: Compound Growth ───────────────────────────────────────
+        rev3, rev5, ebitda3 = self._compute_cagrs(t)
+        params.append(self._check_scalar(
+            rev3, "3Y Revenue CAGR", "Growth",
+            f"≥ {REVENUE_CAGR_3Y_MIN_PCT:.0f}%",
+            lambda v: v >= REVENUE_CAGR_3Y_MIN_PCT,
+        ))
+        params.append(self._check_scalar(
+            rev5, "5Y Revenue CAGR", "Growth",
+            f"≥ {REVENUE_CAGR_5Y_MIN_PCT:.0f}%",
+            lambda v: v >= REVENUE_CAGR_5Y_MIN_PCT,
+        ))
+        params.append(self._check_scalar(
+            ebitda3, "3Y EBITDA CAGR", "Growth",
+            f"≥ {EBITDA_CAGR_3Y_MIN_PCT:.0f}%",
+            lambda v: v >= EBITDA_CAGR_3Y_MIN_PCT,
+        ))
+
+        # ── Category 6: Technical Retracement ────────────────────────────────
+        cmp      = info.get("currentPrice") or info.get("regularMarketPrice")
+        high_52w = info.get("fiftyTwoWeekHigh")
+        if cmp and high_52w:
+            dist = (high_52w - cmp) / high_52w
+            params.append(OverlayParamResult(
+                name="Distance from 52W High", category="Technical",
+                value=round(dist * 100, 1),
+                threshold=f"≤ {DIST_52W_HIGH_MAX * 100:.0f}%",
+                status="PASS" if dist <= DIST_52W_HIGH_MAX else "FAIL",
+                notes=f"{dist * 100:.1f}% below 52W high ₹{high_52w:.1f}",
+            ))
+        else:
+            params.append(OverlayParamResult(
+                name="Distance from 52W High", category="Technical",
+                value=None, threshold="≤ 10%", status="MANUAL_VERIFY", notes="Price data unavailable",
+            ))
+
+        ema50_pass = self._check_50d_ema(ticker, cmp)
+        params.append(OverlayParamResult(
+            name="Above 50-day EMA", category="Technical",
+            value=None, threshold="CMP > 50-day EMA",
+            status="PASS" if ema50_pass is True else ("FAIL" if ema50_pass is False else "MANUAL_VERIFY"),
+            notes="Price above 50-day EMA" if ema50_pass else ("Price below 50-day EMA" if ema50_pass is False else "Data error"),
+        ))
+
+        breakout_ok = self._check_breakout_volume(ticker, cmp, high_52w)
+        params.append(OverlayParamResult(
+            name="ATH Breakout Volume", category="Technical",
+            value=None, threshold=f"≥ {BREAKOUT_VOLUME_MULT}x 20-day avg (if at ATH)",
+            status="PASS" if breakout_ok is True else ("FAIL" if breakout_ok is False else "N/A"),
+            notes="N/A — not at ATH" if breakout_ok is None else ("Breakout volume confirmed" if breakout_ok else "Low-conviction breakout"),
+        ))
+
+        rs_ok = self._check_rs_vs_nifty(ticker)
+        params.append(OverlayParamResult(
+            name="RS vs Nifty (6M)", category="Technical",
+            value=None, threshold="RS line sloping upward over 6 months",
+            status="PASS" if rs_ok is True else ("FAIL" if rs_ok is False else "MANUAL_VERIFY"),
+            notes="Outperforming Nifty 6M" if rs_ok is True else ("Underperforming Nifty 6M" if rs_ok is False else "Data unavailable"),
+        ))
+
+        # ── Tally scores ──────────────────────────────────────────────────────
+        pass_c   = sum(1 for p in params if p.status == "PASS")
+        fail_c   = sum(1 for p in params if p.status == "FAIL")
+        manual_c = sum(1 for p in params if p.status == "MANUAL_VERIFY")
+        na_c     = sum(1 for p in params if p.status == "N/A")
+        scorable = pass_c + fail_c
+        pct      = (pass_c / scorable * 100) if scorable > 0 else 0
+        rating   = "STRONG" if pct >= 80 else ("ADEQUATE" if pct >= 60 else "WEAK")
+
+        return SecondaryOverlayResult(
+            ticker=ticker, params=params,
+            pass_count=pass_c, fail_count=fail_c,
+            manual_count=manual_c, na_count=na_c,
+            overall_rating=rating,
+        )
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _check_scalar(
+        value: Optional[float],
+        name: str,
+        category: str,
+        threshold: str,
+        test_fn,
+    ) -> OverlayParamResult:
+        if value is None:
+            return OverlayParamResult(name=name, category=category, value=None,
+                                     threshold=threshold, status="MANUAL_VERIFY",
+                                     notes="Data unavailable — verify on Screener.in")
+        passed = test_fn(value)
+        return OverlayParamResult(
+            name=name, category=category,
+            value=round(value, 2),
+            threshold=threshold,
+            status="PASS" if passed else "FAIL",
+            notes=f"{value:.2f}",
+        )
+
+    def _compute_gross_margin_variance(self, t: yf.Ticker) -> Optional[float]:
+        try:
+            qfin = t.quarterly_financials
+            if qfin is None or qfin.empty:
+                return None
+            rev_row = self._get_row(qfin, ["Total Revenue", "Revenue"])
+            gp_row  = self._get_row(qfin, ["Gross Profit"])
+            if rev_row is None or gp_row is None:
+                return None
+            rev = rev_row.dropna()
+            gp  = gp_row.dropna()
+            n   = min(len(rev), len(gp), 12)
+            if n < 4:
+                return None
+            margins = [(float(gp.iloc[i]) / float(rev.iloc[i]) * 10_000)
+                       for i in range(n) if float(rev.iloc[i]) > 0]
+            if len(margins) < 4:
+                return None
+            mean = sum(margins) / len(margins)
+            variance = sum((m - mean) ** 2 for m in margins) / len(margins)
+            return variance ** 0.5   # std in bps
+        except Exception:
+            return None
+
+    def _compute_opm_trend(self, t: yf.Ticker) -> Optional[bool]:
+        try:
+            fin = t.financials
+            if fin is None or fin.empty:
+                return None
+            rev_row = self._get_row(fin, ["Total Revenue", "Revenue"])
+            ebit_row = self._get_row(fin, ["EBIT", "Operating Income"])
+            if rev_row is None or ebit_row is None:
+                return None
+            rev  = rev_row.dropna()
+            ebit = ebit_row.dropna()
+            n = min(len(rev), len(ebit), 3)
+            if n < 2:
+                return None
+            margins = [float(ebit.iloc[i]) / float(rev.iloc[i]) * 100
+                       for i in range(n) if float(rev.iloc[i]) > 0]
+            return margins[0] > margins[-1]   # most recent > oldest → rising
+        except Exception:
+            return None
+
+    def _compute_other_income_pbt(self, t: yf.Ticker) -> Optional[float]:
+        try:
+            fin = t.financials
+            if fin is None or fin.empty:
+                return None
+            pbt_row = self._get_row(fin, ["Pretax Income", "Income Before Tax"])
+            oi_row  = self._get_row(fin, ["Other Income Expense", "Non Operating Income Total Other"])
+            if pbt_row is None or oi_row is None:
+                return None
+            pbt = float(pbt_row.dropna().iloc[0])
+            oi  = abs(float(oi_row.dropna().iloc[0]))
+            if pbt <= 0:
+                return None
+            return oi / pbt
+        except Exception:
+            return None
+
+    def _compute_fcf_sales(self, t: yf.Ticker, info: dict) -> Optional[float]:
+        try:
+            cf = t.cashflow
+            fin = t.financials
+            if cf is None or cf.empty or fin is None or fin.empty:
+                return None
+            cfo_row  = self._get_row(cf, ["Operating Cash Flow", "Total Cash From Operating Activities"])
+            capex_row = self._get_row(cf, ["Capital Expenditure", "Purchase Of Property Plant And Equipment"])
+            rev_row  = self._get_row(fin, ["Total Revenue", "Revenue"])
+            if cfo_row is None or rev_row is None:
+                return None
+            cfo = float(cfo_row.dropna().iloc[0])
+            rev = float(rev_row.dropna().iloc[0])
+            capex = abs(float(capex_row.dropna().iloc[0])) if capex_row is not None else 0
+            if rev <= 0:
+                return None
+            return ((cfo - capex) / rev) * 100
+        except Exception:
+            return None
+
+    def _compute_cfo_net_profit_3y(self, t: yf.Ticker) -> Optional[float]:
+        try:
+            cf  = t.cashflow
+            fin = t.financials
+            if cf is None or cf.empty or fin is None or fin.empty:
+                return None
+            cfo_row = self._get_row(cf, ["Operating Cash Flow", "Total Cash From Operating Activities"])
+            ni_row  = self._get_row(fin, ["Net Income", "Net Income Common Stockholders"])
+            if cfo_row is None or ni_row is None:
+                return None
+            cfos = cfo_row.dropna()
+            nis  = ni_row.dropna()
+            n = min(len(cfos), len(nis), 3)
+            if n < 1:
+                return None
+            ratios = [float(cfos.iloc[i]) / float(nis.iloc[i])
+                      for i in range(n) if float(nis.iloc[i]) > 0]
+            return sum(ratios) / len(ratios) if ratios else None
+        except Exception:
+            return None
+
+    def _compute_roic(self, t: yf.Ticker, info: dict) -> Optional[float]:
+        try:
+            fin = t.financials
+            bs  = t.balance_sheet
+            if fin is None or fin.empty or bs is None or bs.empty:
+                return None
+            ebit_row = self._get_row(fin, ["EBIT", "Operating Income"])
+            tax_prov = self._get_row(fin, ["Tax Provision", "Income Tax Expense"])
+            pbt_row  = self._get_row(fin, ["Pretax Income", "Income Before Tax"])
+            eq_row   = self._get_row(bs, ["Stockholders Equity", "Total Stockholders Equity",
+                                          "Common Stock Equity"])
+            debt_row = self._get_row(bs, ["Total Debt", "Long Term Debt And Capital Lease Obligation"])
+            cash_row = self._get_row(bs, ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"])
+
+            if ebit_row is None or eq_row is None:
+                return None
+
+            ebit  = float(ebit_row.dropna().iloc[0])
+            eq    = float(eq_row.dropna().iloc[0])
+            debt  = float(debt_row.dropna().iloc[0]) if debt_row is not None else 0
+            cash  = float(cash_row.dropna().iloc[0]) if cash_row is not None else 0
+
+            tax_rate = 0.25   # default
+            if tax_prov is not None and pbt_row is not None:
+                tp  = float(tax_prov.dropna().iloc[0])
+                pbt = float(pbt_row.dropna().iloc[0])
+                if pbt > 0 and tp > 0:
+                    tax_rate = min(tp / pbt, 0.40)
+
+            nopat = ebit * (1 - tax_rate)
+            ic    = eq + debt - cash
+            if ic <= 0:
+                return None
+            return (nopat / ic) * 100
+        except Exception:
+            return None
+
+    def _compute_asset_turnover(self, t: yf.Ticker) -> Optional[float]:
+        try:
+            fin = t.financials
+            bs  = t.balance_sheet
+            if fin is None or fin.empty or bs is None or bs.empty:
+                return None
+            rev_row = self._get_row(fin, ["Total Revenue", "Revenue"])
+            ta_row  = self._get_row(bs, ["Total Assets"])
+            if rev_row is None or ta_row is None:
+                return None
+            return float(rev_row.dropna().iloc[0]) / float(ta_row.dropna().iloc[0])
+        except Exception:
+            return None
+
+    def _compute_cagrs(self, t: yf.Ticker) -> tuple[Optional[float], Optional[float], Optional[float]]:
+        rev3 = rev5 = ebitda3 = None
+        try:
+            fin = t.financials
+            if fin is None or fin.empty:
+                return None, None, None
+            rev_row    = self._get_row(fin, ["Total Revenue", "Revenue"])
+            ebitda_row = self._get_row(fin, ["EBITDA", "Normalized EBITDA"])
+
+            if rev_row is not None:
+                revs = rev_row.dropna()
+                if len(revs) >= 4:
+                    rev3 = ((float(revs.iloc[0]) / float(revs.iloc[3])) ** (1/3) - 1) * 100
+                if len(revs) >= 6:
+                    rev5 = ((float(revs.iloc[0]) / float(revs.iloc[5])) ** (1/5) - 1) * 100
+
+            if ebitda_row is not None:
+                ebs = ebitda_row.dropna()
+                if len(ebs) >= 4:
+                    ebitda3 = ((float(ebs.iloc[0]) / float(ebs.iloc[3])) ** (1/3) - 1) * 100
+        except Exception:
+            pass
+        return rev3, rev5, ebitda3
+
+    def _check_50d_ema(self, ticker: str, cmp: Optional[float]) -> Optional[bool]:
+        if cmp is None:
+            return None
+        try:
+            hist = yf.Ticker(ticker + NSE_SUFFIX).history(period="3mo")
+            if hist.empty or len(hist) < 50:
+                return None
+            ema50 = float(hist["Close"].ewm(span=50, adjust=False).mean().iloc[-1])
+            return cmp > ema50
+        except Exception:
+            return None
+
+    def _check_breakout_volume(
+        self, ticker: str, cmp: Optional[float], high_52w: Optional[float]
+    ) -> Optional[bool]:
+        if cmp is None or high_52w is None:
+            return None
+        near_ath = (high_52w - cmp) / high_52w <= 0.02   # within 2% of 52W high
+        if not near_ath:
+            return None   # not at ATH — N/A
+        try:
+            hist = yf.Ticker(ticker + NSE_SUFFIX).history(period="2mo")
+            if hist.empty or len(hist) < 21:
+                return None
+            avg_vol = float(hist["Volume"].iloc[-21:-1].mean())
+            today_vol = float(hist["Volume"].iloc[-1])
+            if avg_vol <= 0:
+                return None
+            return today_vol >= avg_vol * BREAKOUT_VOLUME_MULT
+        except Exception:
+            return None
+
+    def _check_rs_vs_nifty(self, ticker: str) -> Optional[bool]:
+        try:
+            stock_hist = yf.Ticker(ticker + NSE_SUFFIX).history(period="6mo")
+            nifty_hist = yf.Ticker(NIFTY_SYMBOL).history(period="6mo")
+            if stock_hist.empty or nifty_hist.empty or len(stock_hist) < 60:
+                return None
+            stock_ret = float(stock_hist["Close"].iloc[-1] / stock_hist["Close"].iloc[0] - 1)
+            nifty_ret = float(nifty_hist["Close"].iloc[-1] / nifty_hist["Close"].iloc[0] - 1)
+            return stock_ret > nifty_ret
+        except Exception:
+            return None
+
+    @staticmethod
+    def _get_row(df, keys: list[str]):
+        for key in keys:
+            if key in df.index:
+                return df.loc[key]
+        return None
+
 
 # ── Orchestrator: CandidateScreener ──────────────────────────────────────────
 
@@ -587,10 +1133,11 @@ class CandidateScreener:
     """
 
     def __init__(self) -> None:
-        self._stage2    = Stage2Checker()
-        self._ud        = UDRatioCalculator()
-        self._funds     = FundamentalScreener()
-        self._valuation = ValuationStressTester()
+        self._stage2     = Stage2Checker()
+        self._ud         = UDRatioCalculator()
+        self._funds      = FundamentalScreener()
+        self._valuation  = ValuationStressTester()
+        self._secondary  = SecondaryOverlayScreener()
 
     def screen(self, ticker: str) -> ScreeningResult:
         result = ScreeningResult(ticker=ticker)
@@ -631,12 +1178,16 @@ class CandidateScreener:
             result.recommendation = f"FAIL: {pe.notes}"
             return result
 
+        # 24-Parameter Secondary Overlay (advisory, never hard-fails)
+        result.secondary = self._secondary.run(ticker)
+
         manual_items = g34.manual_verify_fields
         result.passed_all    = True
+        overlay_rating = result.secondary.overall_rating if result.secondary else "N/A"
         result.recommendation = (
-            "ALL-CLEAR — Ready to size position"
+            f"ALL-CLEAR — Overlay: {overlay_rating}"
             if not manual_items
-            else f"ALL-CLEAR (pending manual verify: {', '.join(manual_items)})"
+            else f"ALL-CLEAR (manual verify: {', '.join(manual_items)}) — Overlay: {overlay_rating}"
         )
         return result
 
@@ -736,23 +1287,43 @@ class ScreeningRunner:
         lines += ["", "## Ready to Acquire (All Gates Passed)", ""]
         if passed:
             lines += [
-                "| Ticker | Entry (CMP) | SL (−9%) | Rec. Shares | Position Value | Risk % | Notes |",
-                "|--------|-------------|---------|-------------|---------------|--------|-------|",
+                "| Ticker | Entry (CMP) | SL (−9%) | Rec. Shares | Position Value | Risk % | Overlay | Notes |",
+                "|--------|-------------|---------|-------------|---------------|--------|---------|-------|",
             ]
             for r in passed:
                 cmp = r.gate1.cmp if r.gate1 else None
+                overlay_rating = r.secondary.overall_rating if r.secondary else "N/A"
                 if cmp and self._portfolio_value > 0:
                     size = self._sizer.size(r.ticker, self._portfolio_value, cmp)
                     lines.append(
                         f"| {r.ticker} | ₹{cmp:.1f} | ₹{size.sl_price:.1f} | "
                         f"{size.recommended_shares} | ₹{size.position_value:,.0f} | "
-                        f"{size.effective_risk_pct:.2f}% | {size.notes[:60]} |"
+                        f"{size.effective_risk_pct:.2f}% | {overlay_rating} | {size.notes[:55]} |"
                     )
                 else:
                     lines.append(
                         f"| {r.ticker} | ₹{cmp:.1f if cmp else '?'} | — | — | — | — | "
-                        f"Set PORTFOLIO_VALUE_INR env var |"
+                        f"{overlay_rating} | Set PORTFOLIO_VALUE_INR env var |"
                     )
+
+            # Detailed 24-parameter overlay for each passer
+            lines += ["", "### 24-Parameter Secondary Overlay Detail", ""]
+            for r in passed:
+                if not r.secondary:
+                    continue
+                s = r.secondary
+                lines.append(f"#### {r.ticker} — {s.overall_rating} "
+                             f"({s.pass_count}✅ {s.fail_count}❌ {s.manual_count}⚠ {s.na_count} N/A)")
+                lines.append("")
+                lines.append("| # | Parameter | Category | Value | Threshold | Status |")
+                lines.append("|---|-----------|----------|-------|-----------|--------|")
+                for i, p in enumerate(s.params, 1):
+                    val_str = f"{p.value}" if p.value is not None else "—"
+                    status_icon = {"PASS": "✅", "FAIL": "❌", "MANUAL_VERIFY": "⚠️", "N/A": "—"}.get(p.status, p.status)
+                    lines.append(
+                        f"| {i} | {p.name} | {p.category} | {val_str} | {p.threshold} | {status_icon} |"
+                    )
+                lines.append("")
         else:
             lines.append("None — no candidates passed all gates today.")
 
@@ -780,7 +1351,11 @@ class ScreeningRunner:
 
         msg_parts = [f"PMS SCREENING | {now}", f"Screened: {len(results)}"]
         if passed:
-            msg_parts.append(f"\nALL-CLEAR ({len(passed)}): {', '.join(r.ticker for r in passed)}")
+            pass_lines = []
+            for r in passed:
+                overlay = r.secondary.overall_rating if r.secondary else "N/A"
+                pass_lines.append(f"  {r.ticker} [{overlay}]")
+            msg_parts.append(f"\nALL-CLEAR ({len(passed)}):\n" + "\n".join(pass_lines))
         else:
             msg_parts.append("\nNo candidates passed all gates today.")
 
