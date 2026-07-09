@@ -1,0 +1,87 @@
+# NSE Portfolio — Single Source of Truth
+# Update via GitHub Actions > Update Portfolio workflow (or scripts/update_portfolio.py).
+# All scripts and the cockpit package load from this file at runtime.
+
+holdings:
+  APTUS:
+    qty: 100
+    cost: 294.70
+    sl: 285.00
+    target: 350.00
+    catalyst: "Citi positive watch; 34% YoY disbursement growth"
+
+  APARINDS:
+    qty: 4
+    cost: 14838.00
+    sl: 13678.00
+    target: 18000.00
+    catalyst: "Saudi Aramco Base Oil JV; National Electricity Plan capex"
+
+  KIRLOSENG:
+    qty: 25
+    cost: 2349.88
+    sl: 2183.00
+    target: 3100.00
+    catalyst: "192 MW HyperNext order; data center monopoly crack"
+
+  AEGISLOG:
+    qty: 40
+    cost: 1002.55
+    sl: 1340.00
+    target: 1350.00
+    catalyst: "Record Liquid Logistics EBITDA; Royal Vopak JV"
+
+  CUMMINSIND:
+    qty: 9
+    cost: 5660.83
+    sl: 5400.00
+    target: 7300.00
+    catalyst: "Data center backup power demand; above 20/50 EMA"
+
+  NAVINFLUOR:
+    qty: 6
+    cost: 7510.00
+    sl: 7103.00
+    target: 9250.00
+    catalyst: "Specialty fluorination capacity; pharma API export ramp"
+
+  WELCORP:
+    qty: 30
+    cost: 1491.70
+    sl: 1350.00
+    target: null
+    catalyst: "SAW pipe order book visibility; oil & gas capex cycle"
+
+  CGPOWER:
+    qty: 50
+    cost: 898.46
+    sl: 880.00
+    target: 1120.00
+    catalyst: "Switchgear/transformer capacity; semiconductor OSAT pilot Sanand"
+
+  "GVT&D":
+    qty: 7
+    cost: 4536.57
+    sl: 4300.00
+    target: null
+    catalyst: "T&D infrastructure; power sector capex visibility"
+
+  TARIL:
+    qty: 58
+    cost: 343.85
+    sl: 323.00
+    target: null
+    catalyst: "Transformer exports; grid modernisation order book"
+
+gtt_orders:
+  SYRMA:
+    qty: 30
+    gtt: 1275.00
+    target: 1600.00
+    catalyst: "PAT +87% FY26; Kaga Electronics Japan JV"
+
+risk_parameters:
+  valid_breakout_volume_multiplier: 1.5
+  ideal_breakout_volume_multiplier: 2.0
+  rsi_overbought_threshold: 70
+  min_risk_reward_ratio: 1.5

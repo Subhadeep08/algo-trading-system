@@ -4,107 +4,119 @@ PMS quantitative screening pipeline for NSE stocks.
 Runs 4 sequential hard gates + PE stress test:
   Gate 1  — Stan Weinstein Stage 2 (150-day MA trend)
   Gate 2  — Up/Down Volume Ratio (institutional accumulation vs distribution)
-  Gate 3  — EBITDA-to-CFO cash conversion quality (≥ 0.85)
+  Gate 3  — EBITDA-to-CFO cash conversion quality (>= 0.85)
   Gate 4  — CANSLIM fundamentals (EPS growth, PAT CAGR, ROCE, D/E)
-  PE Test — 52-week retracement ≤ 10% (confirms active markup phase)
+  PE Test — 52-week retracement <= 10% (confirms active markup phase)
 
 After all gates pass, runs the 24-parameter secondary valuation overlay
 across 6 categories: Valuation, Margin Consistency, Cash Flow Quality,
 Asset Allocation, Compound Growth, and Technical Retracement.
 
-Used standalone (GitHub Actions) and imported by cockpit_runner.py for holding re-qualification.
+Intended to be imported into cockpit_runner.py for holding re-qualification,
+or called directly via the module-level screen() function.
 """
 
 from __future__ import annotations
 
-import argparse
 import logging
 import os
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
 import pytz
-import requests
 import yfinance as yf
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+from cockpit.config import (
+    # File paths
+    SCREENING_RESULTS,
+    WATCHLIST_PATH,
+    # Market data
+    NSE_SUFFIX,
+    NIFTY_50_SYMBOL,
+    # Gate thresholds — sourced from single source of truth
+    DE_RATIO_MAX,
+    EBITDA_CFO_MIN_RATIO,
+    MAX_POSITION_PCT,
+    PE_STRESS_RETRACEMENT_MAX,
+    ANNUAL_PROFIT_GROWTH_MIN,
+    QUARTERLY_EPS_GROWTH_MIN,
+    RISK_PER_TRADE_PCT,
+    ROCE_MIN_PCT,
+    SL_BELOW_ENTRY_PCT,
+    STAGE2_MA_PERIOD,
+    UD_DISTRIBUTION_THRESHOLD,
+    UD_ENTRY_THRESHOLD,
+    UD_LOOKBACK_21,
+    UD_LOOKBACK_50,
 )
+from cockpit.telegram import TelegramNotifier
+
 logger = logging.getLogger(__name__)
 
-# ── Gate thresholds — single source of truth ─────────────────────────────────
-UD_ENTRY_THRESHOLD          = 1.25   # Gate 2: U/D_50 pass threshold
-UD_DISTRIBUTION_THRESHOLD   = 0.75   # Gate 2: U/D_50 disqualify / U/D_21 flag
-UD_LOOKBACK_50              = 50     # sessions for long-term U/D ratio
-UD_LOOKBACK_21              = 21     # sessions for near-term U/D ratio
-STAGE2_MA_PERIOD            = 150    # days (≈ 30-week Weinstein MA)
-STAGE2_MA_SLOPE_LOOKBACK    = 20     # sessions to measure MA slope direction
-STAGE2_CMP_ABOVE_52W_LOW    = 1.20   # CMP must be ≥ 20% above 52W low
-EBITDA_CFO_MIN_RATIO        = 0.85   # Gate 3: minimum cash conversion ratio
-QUARTERLY_EPS_GROWTH_MIN    = 25.0   # Gate 4-C: min QoQ EPS growth %
-QUARTERLY_REV_GROWTH_MIN    = 25.0   # Gate 4-C: min QoQ revenue growth %
-ANNUAL_PROFIT_GROWTH_MIN    = 20.0   # Gate 4-A: min 3-year PAT CAGR %
-ROCE_MIN_PCT                = 15.0   # Gate 4: min ROCE %
-DE_RATIO_MAX                = 0.5    # Gate 4: max Debt/Equity ratio
-PE_STRESS_RETRACEMENT_MAX   = 0.10   # PE test: CMP must be within 10% of 52W high
-RISK_PER_TRADE_PCT          = 0.02   # 2% of portfolio capital at risk per trade
-MAX_POSITION_PCT            = 0.20   # 20% cap per holding
-SL_BELOW_ENTRY_PCT          = 0.09   # 9% default SL below entry price
+# ── Constants not yet in cockpit.config ──────────────────────────────────────
+# Gate 1 — Stage 2 supplementary parameters
+STAGE2_MA_SLOPE_LOOKBACK    = 20      # sessions to measure MA slope direction
+STAGE2_CMP_ABOVE_52W_LOW    = 1.20    # CMP must be >= 20% above 52W low
+
+# Gate 4 — quarterly revenue growth (mirrors QUARTERLY_EPS_GROWTH_MIN)
+QUARTERLY_REV_GROWTH_MIN    = 25.0    # Gate 4-C: min QoQ revenue growth %
+
+# GTT Trailing Stop Slab Table (2026 Groww execution guidelines)
+GTT_TRAILING_STOP_SLABS: list[tuple[float, float, float]] = [
+    (0,       50,      0.05),
+    (50,      100,     0.10),
+    (100,     250,     0.25),
+    (250,     500,     0.50),
+    (500,     1_000,   1.00),
+    (1_000,   2_500,   2.00),
+    (2_500,   10_000,  5.00),
+]
 
 # ── 24-Parameter Secondary Overlay Thresholds ────────────────────────────────
 # Category 1: Valuation & Pricing
-TRAILING_PE_MAX             = 45.0   # <45x (unless EPS growth >40%)
-FORWARD_PE_MAX              = 30.0   # <30x
-EV_EBITDA_MAX               = 25.0   # <25x
-PB_RATIO_MAX                = 6.0    # <6x
-PEG_RATIO_MAX               = 1.2    # ≤1.2
+TRAILING_PE_MAX             = 45.0    # <45x (unless EPS growth >40%)
+FORWARD_PE_MAX              = 30.0    # <30x
+EV_EBITDA_MAX               = 25.0    # <25x
+PB_RATIO_MAX                = 6.0     # <6x
+PEG_RATIO_MAX               = 1.2     # <=1.2
 
 # Category 2: Margin Consistency
-GROSS_MARGIN_VAR_MAX_BPS    = 150    # <±150 bps std over 12 quarters
-NET_MARGIN_MIN_PCT          = 12.0   # >12%
-OTHER_INCOME_PBT_MAX        = 0.10   # ≤10%
+GROSS_MARGIN_VAR_MAX_BPS    = 150     # <+/-150 bps std over 12 quarters
+NET_MARGIN_MIN_PCT          = 12.0    # >12%
+OTHER_INCOME_PBT_MAX        = 0.10    # <=10%
 
 # Category 3: Cash Flow Quality
-FCF_SALES_MIN_PCT           = 8.0    # ≥8%
-FCF_YIELD_MIN_PCT           = 3.0    # ≥3%
-CFO_NET_PROFIT_MIN          = 1.0    # ≥1.0x (3-year rolling)
-DIVIDEND_PAYOUT_MIN         = 0.15   # ≥15% (mature cash generators)
-DIVIDEND_PAYOUT_MAX         = 0.45   # ≤45% (mature cash generators)
+FCF_SALES_MIN_PCT           = 8.0     # >=8%
+FCF_YIELD_MIN_PCT           = 3.0     # >=3%
+CFO_NET_PROFIT_MIN          = 1.0     # >=1.0x (3-year rolling)
+DIVIDEND_PAYOUT_MIN         = 0.15    # >=15% (mature cash generators)
+DIVIDEND_PAYOUT_MAX         = 0.45    # <=45% (mature cash generators)
 
 # Category 4: Asset Allocation
-ROIC_MIN_PCT                = 18.0   # ≥18%
-ROIC_WACC_SPREAD_MIN_BPS    = 600    # ≥600 bps (manual verify — needs WACC)
-REINVESTMENT_RATE_MIN_PCT   = 50.0   # ≥50% (high-growth names; manual verify)
-ASSET_TURNOVER_MIN          = 1.5    # ≥1.5x
+ROIC_MIN_PCT                = 18.0    # >=18%
+ROIC_WACC_SPREAD_MIN_BPS    = 600     # >=600 bps (manual verify — needs WACC)
+REINVESTMENT_RATE_MIN_PCT   = 50.0    # >=50% (high-growth names; manual verify)
+ASSET_TURNOVER_MIN          = 1.5     # >=1.5x
 
 # Category 5: Compound Growth
-REVENUE_CAGR_3Y_MIN_PCT     = 18.0   # ≥18%
-REVENUE_CAGR_5Y_MIN_PCT     = 15.0   # ≥15%
-EBITDA_CAGR_3Y_MIN_PCT      = 22.0   # ≥22%
+REVENUE_CAGR_3Y_MIN_PCT     = 18.0    # >=18%
+REVENUE_CAGR_5Y_MIN_PCT     = 15.0    # >=15%
+EBITDA_CAGR_3Y_MIN_PCT      = 22.0    # >=22%
 
 # Category 6: Technical Retracement
-DIST_52W_HIGH_MAX           = 0.10   # ≤10% below 52W high (same as PE_STRESS_RETRACEMENT_MAX)
-BREAKOUT_VOLUME_MULT        = 1.5    # ≥1.5x 20-day avg vol at ATH breakout
+DIST_52W_HIGH_MAX           = 0.10    # <=10% below 52W high (same as PE_STRESS_RETRACEMENT_MAX)
+BREAKOUT_VOLUME_MULT        = 1.5     # >=1.5x 20-day avg vol at ATH breakout
 
-# ── GTT Trailing Stop Slab Table (2026 Groww execution guidelines) ────────────
-GTT_TRAILING_STOP_SLABS: list[tuple[float, float, float]] = [
-    (0,      50,     0.05),
-    (50,     100,    0.10),
-    (100,    250,    0.25),
-    (250,    500,    0.50),
-    (500,    1_000,  1.00),
-    (1_000,  2_500,  2.00),
-    (2_500,  10_000, 5.00),
-]
 
-NSE_SUFFIX                  = ".NS"
-NIFTY_SYMBOL                = "^NSEI"
-SCREENING_RESULTS_PATH      = ".claude/skills/portfolio-cockpit/references/screening-results.md"
-WATCHLIST_PATH              = ".claude/skills/portfolio-cockpit/references/watchlist.md"
+# ── Module-level utility ──────────────────────────────────────────────────────
+
+def _get_row(df, keys: list[str]):
+    """Return the first matching row from a DataFrame by a list of candidate index labels."""
+    for key in keys:
+        if key in df.index:
+            return df.loc[key]
+    return None
 
 
 # ── Result data-classes ───────────────────────────────────────────────────────
@@ -211,7 +223,7 @@ class Stage2Checker:
     Pass criteria:
       (a) CMP > 150-day MA
       (b) 150-day MA today > 150-day MA 20 sessions ago (upslope)
-      (c) CMP > 52-week low × 1.20
+      (c) CMP > 52-week low * 1.20
     """
 
     def check(self, ticker: str) -> Stage2Result:
@@ -224,7 +236,7 @@ class Stage2Checker:
         if hist.empty or len(hist) < STAGE2_MA_PERIOD:
             return Stage2Result(
                 ticker=ticker, passed=False,
-                notes=f"INSUFFICIENT DATA: {len(hist)} rows (need {STAGE2_MA_PERIOD})"
+                notes=f"INSUFFICIENT DATA: {len(hist)} rows (need {STAGE2_MA_PERIOD})",
             )
 
         close = hist["Close"]
@@ -233,8 +245,10 @@ class Stage2Checker:
         ma_now = float(ma.iloc[-1])
 
         if len(ma.dropna()) < STAGE2_MA_SLOPE_LOOKBACK + 1:
-            return Stage2Result(ticker=ticker, passed=False, cmp=cmp, ma_150=ma_now,
-                                notes="Insufficient MA history for slope check")
+            return Stage2Result(
+                ticker=ticker, passed=False, cmp=cmp, ma_150=ma_now,
+                notes="Insufficient MA history for slope check",
+            )
 
         ma_20d_ago = float(ma.iloc[-(STAGE2_MA_SLOPE_LOOKBACK + 1)])
         low_52w = float(close.min())
@@ -256,7 +270,7 @@ class Stage2Checker:
 
         notes_parts = []
         if not crit_a:
-            notes_parts.append(f"CMP ₹{cmp:.1f} < MA150 ₹{ma_now:.1f}")
+            notes_parts.append(f"CMP Rs{cmp:.1f} < MA150 Rs{ma_now:.1f}")
         if not crit_b:
             notes_parts.append(f"MA slope flat/down ({ma_now:.1f} vs {ma_20d_ago:.1f})")
         if not crit_c:
@@ -293,7 +307,7 @@ class UDRatioCalculator:
         if hist.empty or len(hist) < needed:
             return UDRatioResult(
                 ticker=ticker, passed=False,
-                notes=f"INSUFFICIENT DATA: {len(hist)} rows (need {needed})"
+                notes=f"INSUFFICIENT DATA: {len(hist)} rows (need {needed})",
             )
 
         df = hist.copy()
@@ -314,7 +328,7 @@ class UDRatioCalculator:
         if ud_50 is None:
             return UDRatioResult(ticker=ticker, passed=False, notes="No down-day volume data")
 
-        disqualified     = ud_50 < UD_DISTRIBUTION_THRESHOLD
+        disqualified      = ud_50 < UD_DISTRIBUTION_THRESHOLD
         distribution_flag = (ud_21 is not None) and (ud_21 < UD_DISTRIBUTION_THRESHOLD)
         passed = ud_50 >= UD_ENTRY_THRESHOLD and not disqualified
 
@@ -322,7 +336,7 @@ class UDRatioCalculator:
         if disqualified:
             notes_parts.append(f"DISQUALIFY: U/D_50={ud_50:.2f} < {UD_DISTRIBUTION_THRESHOLD}")
         elif not passed:
-            notes_parts.append(f"WEAK: U/D_50={ud_50:.2f} (need ≥{UD_ENTRY_THRESHOLD})")
+            notes_parts.append(f"WEAK: U/D_50={ud_50:.2f} (need >={UD_ENTRY_THRESHOLD})")
         if distribution_flag:
             notes_parts.append(f"DISTRIBUTION: U/D_21={ud_21:.2f} < {UD_DISTRIBUTION_THRESHOLD}")
 
@@ -341,11 +355,11 @@ class UDRatioCalculator:
 
 class FundamentalScreener:
     """
-    Gate 3: EBITDA-to-CFO ≥ 0.85 (cash conversion quality)
+    Gate 3: EBITDA-to-CFO >= 0.85 (cash conversion quality)
     Gate 4: CANSLIM-derived fundamentals
-      4-A: 3-year annual net profit CAGR ≥ 20%
-      4-B: D/E ≤ 0.5, ROCE ≥ 15%
-      4-C: Current quarter EPS/revenue growth ≥ 25% YoY
+      4-A: 3-year annual net profit CAGR >= 20%
+      4-B: D/E <= 0.5, ROCE >= 15%
+      4-C: Current quarter EPS/revenue growth >= 25% YoY
     """
 
     def screen(self, ticker: str) -> FundamentalResult:
@@ -355,7 +369,7 @@ class FundamentalScreener:
         fail_reasons: list[str] = []
 
         # ── Gate 3: EBITDA-to-CFO ────────────────────────────────────────────
-        ebitda_cfo_ratio = self._compute_ebitda_cfo(t, manual_verify)
+        ebitda_cfo_ratio = self._compute_ebitda_cfo(t)
 
         gate3_pass = True
         if ebitda_cfo_ratio is None:
@@ -365,7 +379,7 @@ class FundamentalScreener:
             fail_reasons.append(f"EBITDA-CFO={ebitda_cfo_ratio:.2f} < {EBITDA_CFO_MIN_RATIO}")
 
         # ── Gate 4-A: Annual PAT CAGR ────────────────────────────────────────
-        annual_cagr = self._compute_annual_pat_cagr(t, manual_verify)
+        annual_cagr = self._compute_annual_pat_cagr(t)
         gate4a_pass = True
         if annual_cagr is None:
             manual_verify.append("Annual PAT CAGR")
@@ -374,7 +388,7 @@ class FundamentalScreener:
             fail_reasons.append(f"PAT CAGR={annual_cagr:.1f}% < {ANNUAL_PROFIT_GROWTH_MIN}%")
 
         # ── Gate 4-B: Balance sheet ratios ───────────────────────────────────
-        de_ratio, roce_pct = self._compute_balance_sheet_ratios(t, manual_verify)
+        de_ratio, roce_pct = self._compute_balance_sheet_ratios(t)
         gate4b_pass = True
         if de_ratio is None:
             manual_verify.append("D/E ratio")
@@ -388,7 +402,7 @@ class FundamentalScreener:
             fail_reasons.append(f"ROCE={roce_pct:.1f}% < {ROCE_MIN_PCT}%")
 
         # ── Gate 4-C: Quarterly growth ───────────────────────────────────────
-        eps_growth, rev_growth = self._compute_quarterly_growth(t, manual_verify)
+        eps_growth, rev_growth = self._compute_quarterly_growth(t)
         gate4c_pass = True
         if eps_growth is None:
             manual_verify.append("Quarterly EPS growth")
@@ -417,12 +431,12 @@ class FundamentalScreener:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
-    def _compute_ebitda_cfo(self, t: yf.Ticker, manual_verify: list[str]) -> Optional[float]:
+    def _compute_ebitda_cfo(self, t: yf.Ticker) -> Optional[float]:
         try:
             cf = t.cashflow
             if cf is None or cf.empty:
                 return None
-            cfo = self._get_row(cf, ["Operating Cash Flow", "Total Cash From Operating Activities"])
+            cfo = _get_row(cf, ["Operating Cash Flow", "Total Cash From Operating Activities"])
             if cfo is None:
                 return None
             cfo_val = float(cfo.iloc[0])
@@ -434,7 +448,7 @@ class FundamentalScreener:
             else:
                 fin = t.financials
                 if fin is not None and not fin.empty:
-                    ebitda_row = self._get_row(fin, ["EBITDA", "Normalized EBITDA"])
+                    ebitda_row = _get_row(fin, ["EBITDA", "Normalized EBITDA"])
                     if ebitda_row is not None:
                         ebitda_val = float(ebitda_row.iloc[0])
 
@@ -444,12 +458,12 @@ class FundamentalScreener:
         except Exception:
             return None
 
-    def _compute_annual_pat_cagr(self, t: yf.Ticker, manual_verify: list[str]) -> Optional[float]:
+    def _compute_annual_pat_cagr(self, t: yf.Ticker) -> Optional[float]:
         try:
             fin = t.financials
             if fin is None or fin.empty:
                 return None
-            pat_row = self._get_row(fin, ["Net Income", "Net Income Common Stockholders"])
+            pat_row = _get_row(fin, ["Net Income", "Net Income Common Stockholders"])
             if pat_row is None or len(pat_row) < 4:
                 return None
             pat_values = pat_row.dropna()
@@ -465,7 +479,7 @@ class FundamentalScreener:
             return None
 
     def _compute_balance_sheet_ratios(
-        self, t: yf.Ticker, manual_verify: list[str]
+        self, t: yf.Ticker
     ) -> tuple[Optional[float], Optional[float]]:
         de_ratio = None
         roce_pct = None
@@ -474,16 +488,16 @@ class FundamentalScreener:
             if bs is None or bs.empty:
                 return None, None
 
-            equity = self._get_row(bs, [
+            equity = _get_row(bs, [
                 "Stockholders Equity", "Total Stockholders Equity",
                 "Common Stock Equity", "Total Equity Gross Minority Interest",
             ])
-            debt = self._get_row(bs, [
+            debt = _get_row(bs, [
                 "Total Debt", "Long Term Debt And Capital Lease Obligation",
                 "Total Long Term Debt",
             ])
-            total_assets = self._get_row(bs, ["Total Assets"])
-            current_liab = self._get_row(bs, ["Current Liabilities", "Total Current Liabilities"])
+            total_assets = _get_row(bs, ["Total Assets"])
+            current_liab = _get_row(bs, ["Current Liabilities", "Total Current Liabilities"])
 
             if equity is not None and debt is not None:
                 equity_val = float(equity.iloc[0])
@@ -494,12 +508,12 @@ class FundamentalScreener:
             if total_assets is not None and current_liab is not None:
                 fin = t.financials
                 if fin is not None and not fin.empty:
-                    ebit_row = self._get_row(fin, ["EBIT", "Operating Income"])
+                    ebit_row = _get_row(fin, ["EBIT", "Operating Income"])
                     if ebit_row is not None:
-                        ebit_val     = float(ebit_row.iloc[0])
-                        ta_val       = float(total_assets.iloc[0])
-                        cl_val       = float(current_liab.iloc[0])
-                        capital_emp  = ta_val - cl_val
+                        ebit_val    = float(ebit_row.iloc[0])
+                        ta_val      = float(total_assets.iloc[0])
+                        cl_val      = float(current_liab.iloc[0])
+                        capital_emp = ta_val - cl_val
                         if capital_emp > 0:
                             roce_pct = (ebit_val / capital_emp) * 100
         except Exception:
@@ -507,7 +521,7 @@ class FundamentalScreener:
         return de_ratio, roce_pct
 
     def _compute_quarterly_growth(
-        self, t: yf.Ticker, manual_verify: list[str]
+        self, t: yf.Ticker
     ) -> tuple[Optional[float], Optional[float]]:
         eps_growth = None
         rev_growth = None
@@ -516,10 +530,8 @@ class FundamentalScreener:
             if qfin is None or qfin.empty or qfin.shape[1] < 5:
                 return None, None
 
-            eps_row = self._get_row(qfin, ["Basic EPS", "Diluted EPS", "Net Income"])
-            rev_row = self._get_row(qfin, [
-                "Total Revenue", "Revenue", "Operating Revenue",
-            ])
+            eps_row = _get_row(qfin, ["Basic EPS", "Diluted EPS", "Net Income"])
+            rev_row = _get_row(qfin, ["Total Revenue", "Revenue", "Operating Revenue"])
 
             if eps_row is not None and len(eps_row.dropna()) >= 5:
                 eps_vals = eps_row.dropna()
@@ -538,13 +550,6 @@ class FundamentalScreener:
             pass
         return eps_growth, rev_growth
 
-    @staticmethod
-    def _get_row(df, keys: list[str]):
-        for key in keys:
-            if key in df.index:
-                return df.loc[key]
-        return None
-
 
 # ── Forward PE Stress Test ────────────────────────────────────────────────────
 
@@ -552,7 +557,7 @@ class ValuationStressTester:
     """
     Checks:
       (a) Entry PE and Forward PE (informational)
-      (b) 52-week retracement: CMP ≥ 52W high × (1 - PE_STRESS_RETRACEMENT_MAX)
+      (b) 52-week retracement: CMP >= 52W high * (1 - PE_STRESS_RETRACEMENT_MAX)
     Pass = within 10% of 52-week high (confirms active markup phase; no trapped overhead sellers).
     Full PE compression stress test (target PE vs 5-year median) flagged for manual verify.
     """
@@ -564,23 +569,25 @@ class ValuationStressTester:
         except Exception as exc:
             return PEStressResult(ticker=ticker, passed=False, notes=f"DATA ERROR: {exc}")
 
-        cmp        = info.get("currentPrice") or info.get("regularMarketPrice")
-        high_52w   = info.get("fiftyTwoWeekHigh")
-        ttm_eps    = info.get("trailingEps")
-        fwd_eps    = info.get("forwardEps")
+        cmp      = info.get("currentPrice") or info.get("regularMarketPrice")
+        high_52w = info.get("fiftyTwoWeekHigh")
+        ttm_eps  = info.get("trailingEps")
+        fwd_eps  = info.get("forwardEps")
 
         if cmp is None or high_52w is None:
-            return PEStressResult(ticker=ticker, passed=False,
-                                  notes="CMP or 52W high unavailable")
+            return PEStressResult(
+                ticker=ticker, passed=False,
+                notes="CMP or 52W high unavailable",
+            )
 
         retracement_pct = (high_52w - cmp) / high_52w
         passed = retracement_pct <= PE_STRESS_RETRACEMENT_MAX
 
-        entry_pe  = (cmp / ttm_eps) if ttm_eps and ttm_eps > 0 else None
+        entry_pe   = (cmp / ttm_eps) if ttm_eps and ttm_eps > 0 else None
         forward_pe = (cmp / fwd_eps) if fwd_eps and fwd_eps > 0 else None
 
         notes = (
-            f"CMP ₹{cmp:.1f} is {retracement_pct * 100:.1f}% below 52W high ₹{high_52w:.1f}"
+            f"CMP Rs{cmp:.1f} is {retracement_pct * 100:.1f}% below 52W high Rs{high_52w:.1f}"
             + (f"; Entry PE={entry_pe:.1f}" if entry_pe else "; TTM EPS unavailable")
             + (f"; Fwd PE={forward_pe:.1f}" if forward_pe else "")
         )
@@ -602,10 +609,10 @@ class ValuationStressTester:
 class PositionSizer:
     """
     Risk-budgeted position sizing:
-      Risk amount   = portfolio_value × RISK_PER_TRADE_PCT
-      Raw shares    = risk_amount / (entry_price − sl_price)
-      Position val  = shares × entry_price
-      Cap at        = portfolio_value × MAX_POSITION_PCT
+      Risk amount   = portfolio_value * RISK_PER_TRADE_PCT
+      Raw shares    = risk_amount / (entry_price - sl_price)
+      Position val  = shares * entry_price
+      Cap at        = portfolio_value * MAX_POSITION_PCT
     """
 
     def size(
@@ -618,8 +625,8 @@ class PositionSizer:
         if sl_price is None:
             sl_price = entry_price * (1 - SL_BELOW_ENTRY_PCT)
 
-        risk_amount  = portfolio_value * RISK_PER_TRADE_PCT
-        gap          = entry_price - sl_price
+        risk_amount = portfolio_value * RISK_PER_TRADE_PCT
+        gap         = entry_price - sl_price
         if gap <= 0:
             return PositionSizeResult(
                 ticker=ticker, entry_price=entry_price, sl_price=sl_price,
@@ -627,17 +634,17 @@ class PositionSizer:
                 capped=False, notes="SL must be below entry price",
             )
 
-        raw_shares      = risk_amount / gap
-        raw_position    = raw_shares * entry_price
-        max_position    = portfolio_value * MAX_POSITION_PCT
-        capped          = raw_position > max_position
-        final_shares    = int(max_position / entry_price) if capped else int(raw_shares)
-        position_value  = final_shares * entry_price
-        eff_risk_pct    = (final_shares * gap / portfolio_value) * 100
+        raw_shares     = risk_amount / gap
+        raw_position   = raw_shares * entry_price
+        max_position   = portfolio_value * MAX_POSITION_PCT
+        capped         = raw_position > max_position
+        final_shares   = int(max_position / entry_price) if capped else int(raw_shares)
+        position_value = final_shares * entry_price
+        eff_risk_pct   = (final_shares * gap / portfolio_value) * 100
 
         notes = (
-            f"Risk ₹{risk_amount:.0f} / gap ₹{gap:.1f} = {raw_shares:.0f} raw shares"
-            + (f"; CAPPED at {MAX_POSITION_PCT * 100:.0f}% (₹{max_position:.0f})" if capped else "")
+            f"Risk Rs{risk_amount:.0f} / gap Rs{gap:.1f} = {raw_shares:.0f} raw shares"
+            + (f"; CAPPED at {MAX_POSITION_PCT * 100:.0f}% (Rs{max_position:.0f})" if capped else "")
         )
         return PositionSizeResult(
             ticker=ticker,
@@ -652,7 +659,7 @@ class PositionSizer:
 
     @staticmethod
     def compute_trailing_stop_min(price: float) -> float:
-        """Return the minimum trailing-stop increment (₹) for a given price slab."""
+        """Return the minimum trailing-stop increment (Rs) for a given price slab."""
         for lo, hi, tick in GTT_TRAILING_STOP_SLABS:
             if lo <= price < hi:
                 return tick
@@ -701,7 +708,7 @@ class SecondaryOverlayScreener:
         ))
         params.append(self._check_scalar(
             info.get("pegRatio"), "PEG Ratio", "Valuation",
-            f"≤ {PEG_RATIO_MAX}",
+            f"<= {PEG_RATIO_MAX}",
             lambda v: v <= PEG_RATIO_MAX,
         ))
 
@@ -709,7 +716,7 @@ class SecondaryOverlayScreener:
         gm_var = self._compute_gross_margin_variance(t)
         params.append(self._check_scalar(
             gm_var, "Gross Margin Variance (12Q)", "Margins",
-            f"< ±{GROSS_MARGIN_VAR_MAX_BPS} bps std over 12 quarters",
+            f"< +/-{GROSS_MARGIN_VAR_MAX_BPS} bps std over 12 quarters",
             lambda v: v < GROSS_MARGIN_VAR_MAX_BPS,
         ))
         opm_rising = self._compute_opm_trend(t)
@@ -729,7 +736,7 @@ class SecondaryOverlayScreener:
         other_pbt = self._compute_other_income_pbt(t)
         params.append(self._check_scalar(
             other_pbt, "Other Income / PBT", "Margins",
-            f"≤ {OTHER_INCOME_PBT_MAX * 100:.0f}%",
+            f"<= {OTHER_INCOME_PBT_MAX * 100:.0f}%",
             lambda v: v <= OTHER_INCOME_PBT_MAX,
         ))
 
@@ -737,21 +744,21 @@ class SecondaryOverlayScreener:
         fcf_sales = self._compute_fcf_sales(t, info)
         params.append(self._check_scalar(
             fcf_sales, "FCF/Sales", "Cash Flow",
-            f"≥ {FCF_SALES_MIN_PCT:.0f}%",
+            f">= {FCF_SALES_MIN_PCT:.0f}%",
             lambda v: v >= FCF_SALES_MIN_PCT,
         ))
-        mkt_cap  = info.get("marketCap")
-        free_cf  = info.get("freeCashflow")
+        mkt_cap = info.get("marketCap")
+        free_cf = info.get("freeCashflow")
         fcf_yield = (free_cf / mkt_cap * 100) if (free_cf and mkt_cap and mkt_cap > 0) else None
         params.append(self._check_scalar(
             fcf_yield, "FCF Yield", "Cash Flow",
-            f"≥ {FCF_YIELD_MIN_PCT:.0f}%",
+            f">= {FCF_YIELD_MIN_PCT:.0f}%",
             lambda v: v >= FCF_YIELD_MIN_PCT,
         ))
         cfo_np = self._compute_cfo_net_profit_3y(t)
         params.append(self._check_scalar(
             cfo_np, "CFO/Net Profit (3Y avg)", "Cash Flow",
-            f"≥ {CFO_NET_PROFIT_MIN}x",
+            f">= {CFO_NET_PROFIT_MIN}x",
             lambda v: v >= CFO_NET_PROFIT_MIN,
         ))
         payout = info.get("payoutRatio")
@@ -760,38 +767,38 @@ class SecondaryOverlayScreener:
             params.append(OverlayParamResult(
                 name="Dividend Payout Ratio", category="Cash Flow",
                 value=round(payout * 100, 1),
-                threshold=f"{DIVIDEND_PAYOUT_MIN * 100:.0f}–{DIVIDEND_PAYOUT_MAX * 100:.0f}% (mature cash generators)",
+                threshold=f"{DIVIDEND_PAYOUT_MIN * 100:.0f}-{DIVIDEND_PAYOUT_MAX * 100:.0f}% (mature cash generators)",
                 status="PASS" if in_range else "FAIL",
-                notes=f"{payout * 100:.1f}% — {'in range' if in_range else 'out of range'}",
+                notes=f"{payout * 100:.1f}% -- {'in range' if in_range else 'out of range'}",
             ))
         else:
             params.append(OverlayParamResult(
                 name="Dividend Payout Ratio", category="Cash Flow",
-                value=None, threshold="15–45% (mature cash generators)",
-                status="N/A", notes="No dividend or data unavailable — conditional metric",
+                value=None, threshold="15-45% (mature cash generators)",
+                status="N/A", notes="No dividend or data unavailable -- conditional metric",
             ))
 
         # ── Category 4: Asset Allocation ─────────────────────────────────────
         roic = self._compute_roic(t, info)
         params.append(self._check_scalar(
             roic, "ROIC", "Asset Alloc",
-            f"≥ {ROIC_MIN_PCT:.0f}%",
+            f">= {ROIC_MIN_PCT:.0f}%",
             lambda v: v >= ROIC_MIN_PCT,
         ))
         params.append(OverlayParamResult(
             name="ROIC-WACC Spread", category="Asset Alloc",
-            value=None, threshold=f"≥ {ROIC_WACC_SPREAD_MIN_BPS} bps",
+            value=None, threshold=f">= {ROIC_WACC_SPREAD_MIN_BPS} bps",
             status="MANUAL_VERIFY", notes="WACC requires manual CAPM calculation",
         ))
         params.append(OverlayParamResult(
             name="Reinvestment Rate", category="Asset Alloc",
-            value=None, threshold=f"≥ {REINVESTMENT_RATE_MIN_PCT:.0f}% (high-growth names)",
-            status="MANUAL_VERIFY", notes="(CapEx + ΔNWC) / NOPAT — verify on Screener.in",
+            value=None, threshold=f">= {REINVESTMENT_RATE_MIN_PCT:.0f}% (high-growth names)",
+            status="MANUAL_VERIFY", notes="(CapEx + dNWC) / NOPAT -- verify on Screener.in",
         ))
         at = self._compute_asset_turnover(t)
         params.append(self._check_scalar(
             at, "Asset Turnover", "Asset Alloc",
-            f"≥ {ASSET_TURNOVER_MIN}x",
+            f">= {ASSET_TURNOVER_MIN}x",
             lambda v: v >= ASSET_TURNOVER_MIN,
         ))
 
@@ -799,17 +806,17 @@ class SecondaryOverlayScreener:
         rev3, rev5, ebitda3 = self._compute_cagrs(t)
         params.append(self._check_scalar(
             rev3, "3Y Revenue CAGR", "Growth",
-            f"≥ {REVENUE_CAGR_3Y_MIN_PCT:.0f}%",
+            f">= {REVENUE_CAGR_3Y_MIN_PCT:.0f}%",
             lambda v: v >= REVENUE_CAGR_3Y_MIN_PCT,
         ))
         params.append(self._check_scalar(
             rev5, "5Y Revenue CAGR", "Growth",
-            f"≥ {REVENUE_CAGR_5Y_MIN_PCT:.0f}%",
+            f">= {REVENUE_CAGR_5Y_MIN_PCT:.0f}%",
             lambda v: v >= REVENUE_CAGR_5Y_MIN_PCT,
         ))
         params.append(self._check_scalar(
             ebitda3, "3Y EBITDA CAGR", "Growth",
-            f"≥ {EBITDA_CAGR_3Y_MIN_PCT:.0f}%",
+            f">= {EBITDA_CAGR_3Y_MIN_PCT:.0f}%",
             lambda v: v >= EBITDA_CAGR_3Y_MIN_PCT,
         ))
 
@@ -821,14 +828,15 @@ class SecondaryOverlayScreener:
             params.append(OverlayParamResult(
                 name="Distance from 52W High", category="Technical",
                 value=round(dist * 100, 1),
-                threshold=f"≤ {DIST_52W_HIGH_MAX * 100:.0f}%",
+                threshold=f"<= {DIST_52W_HIGH_MAX * 100:.0f}%",
                 status="PASS" if dist <= DIST_52W_HIGH_MAX else "FAIL",
-                notes=f"{dist * 100:.1f}% below 52W high ₹{high_52w:.1f}",
+                notes=f"{dist * 100:.1f}% below 52W high Rs{high_52w:.1f}",
             ))
         else:
             params.append(OverlayParamResult(
                 name="Distance from 52W High", category="Technical",
-                value=None, threshold="≤ 10%", status="MANUAL_VERIFY", notes="Price data unavailable",
+                value=None, threshold="<= 10%", status="MANUAL_VERIFY",
+                notes="Price data unavailable",
             ))
 
         ema50_pass = self._check_50d_ema(ticker, cmp)
@@ -842,9 +850,9 @@ class SecondaryOverlayScreener:
         breakout_ok = self._check_breakout_volume(ticker, cmp, high_52w)
         params.append(OverlayParamResult(
             name="ATH Breakout Volume", category="Technical",
-            value=None, threshold=f"≥ {BREAKOUT_VOLUME_MULT}x 20-day avg (if at ATH)",
+            value=None, threshold=f">= {BREAKOUT_VOLUME_MULT}x 20-day avg (if at ATH)",
             status="PASS" if breakout_ok is True else ("FAIL" if breakout_ok is False else "N/A"),
-            notes="N/A — not at ATH" if breakout_ok is None else ("Breakout volume confirmed" if breakout_ok else "Low-conviction breakout"),
+            notes="N/A -- not at ATH" if breakout_ok is None else ("Breakout volume confirmed" if breakout_ok else "Low-conviction breakout"),
         ))
 
         rs_ok = self._check_rs_vs_nifty(ticker)
@@ -882,9 +890,11 @@ class SecondaryOverlayScreener:
         test_fn,
     ) -> OverlayParamResult:
         if value is None:
-            return OverlayParamResult(name=name, category=category, value=None,
-                                     threshold=threshold, status="MANUAL_VERIFY",
-                                     notes="Data unavailable — verify on Screener.in")
+            return OverlayParamResult(
+                name=name, category=category, value=None,
+                threshold=threshold, status="MANUAL_VERIFY",
+                notes="Data unavailable -- verify on Screener.in",
+            )
         passed = test_fn(value)
         return OverlayParamResult(
             name=name, category=category,
@@ -899,8 +909,8 @@ class SecondaryOverlayScreener:
             qfin = t.quarterly_financials
             if qfin is None or qfin.empty:
                 return None
-            rev_row = self._get_row(qfin, ["Total Revenue", "Revenue"])
-            gp_row  = self._get_row(qfin, ["Gross Profit"])
+            rev_row = _get_row(qfin, ["Total Revenue", "Revenue"])
+            gp_row  = _get_row(qfin, ["Gross Profit"])
             if rev_row is None or gp_row is None:
                 return None
             rev = rev_row.dropna()
@@ -908,8 +918,10 @@ class SecondaryOverlayScreener:
             n   = min(len(rev), len(gp), 12)
             if n < 4:
                 return None
-            margins = [(float(gp.iloc[i]) / float(rev.iloc[i]) * 10_000)
-                       for i in range(n) if float(rev.iloc[i]) > 0]
+            margins = [
+                (float(gp.iloc[i]) / float(rev.iloc[i]) * 10_000)
+                for i in range(n) if float(rev.iloc[i]) > 0
+            ]
             if len(margins) < 4:
                 return None
             mean = sum(margins) / len(margins)
@@ -923,8 +935,8 @@ class SecondaryOverlayScreener:
             fin = t.financials
             if fin is None or fin.empty:
                 return None
-            rev_row = self._get_row(fin, ["Total Revenue", "Revenue"])
-            ebit_row = self._get_row(fin, ["EBIT", "Operating Income"])
+            rev_row  = _get_row(fin, ["Total Revenue", "Revenue"])
+            ebit_row = _get_row(fin, ["EBIT", "Operating Income"])
             if rev_row is None or ebit_row is None:
                 return None
             rev  = rev_row.dropna()
@@ -932,9 +944,11 @@ class SecondaryOverlayScreener:
             n = min(len(rev), len(ebit), 3)
             if n < 2:
                 return None
-            margins = [float(ebit.iloc[i]) / float(rev.iloc[i]) * 100
-                       for i in range(n) if float(rev.iloc[i]) > 0]
-            return margins[0] > margins[-1]   # most recent > oldest → rising
+            margins = [
+                float(ebit.iloc[i]) / float(rev.iloc[i]) * 100
+                for i in range(n) if float(rev.iloc[i]) > 0
+            ]
+            return margins[0] > margins[-1]   # most recent > oldest -> rising
         except Exception:
             return None
 
@@ -943,8 +957,8 @@ class SecondaryOverlayScreener:
             fin = t.financials
             if fin is None or fin.empty:
                 return None
-            pbt_row = self._get_row(fin, ["Pretax Income", "Income Before Tax"])
-            oi_row  = self._get_row(fin, ["Other Income Expense", "Non Operating Income Total Other"])
+            pbt_row = _get_row(fin, ["Pretax Income", "Income Before Tax"])
+            oi_row  = _get_row(fin, ["Other Income Expense", "Non Operating Income Total Other"])
             if pbt_row is None or oi_row is None:
                 return None
             pbt = float(pbt_row.dropna().iloc[0])
@@ -957,17 +971,17 @@ class SecondaryOverlayScreener:
 
     def _compute_fcf_sales(self, t: yf.Ticker, info: dict) -> Optional[float]:
         try:
-            cf = t.cashflow
+            cf  = t.cashflow
             fin = t.financials
             if cf is None or cf.empty or fin is None or fin.empty:
                 return None
-            cfo_row  = self._get_row(cf, ["Operating Cash Flow", "Total Cash From Operating Activities"])
-            capex_row = self._get_row(cf, ["Capital Expenditure", "Purchase Of Property Plant And Equipment"])
-            rev_row  = self._get_row(fin, ["Total Revenue", "Revenue"])
+            cfo_row   = _get_row(cf, ["Operating Cash Flow", "Total Cash From Operating Activities"])
+            capex_row = _get_row(cf, ["Capital Expenditure", "Purchase Of Property Plant And Equipment"])
+            rev_row   = _get_row(fin, ["Total Revenue", "Revenue"])
             if cfo_row is None or rev_row is None:
                 return None
-            cfo = float(cfo_row.dropna().iloc[0])
-            rev = float(rev_row.dropna().iloc[0])
+            cfo   = float(cfo_row.dropna().iloc[0])
+            rev   = float(rev_row.dropna().iloc[0])
             capex = abs(float(capex_row.dropna().iloc[0])) if capex_row is not None else 0
             if rev <= 0:
                 return None
@@ -981,8 +995,8 @@ class SecondaryOverlayScreener:
             fin = t.financials
             if cf is None or cf.empty or fin is None or fin.empty:
                 return None
-            cfo_row = self._get_row(cf, ["Operating Cash Flow", "Total Cash From Operating Activities"])
-            ni_row  = self._get_row(fin, ["Net Income", "Net Income Common Stockholders"])
+            cfo_row = _get_row(cf, ["Operating Cash Flow", "Total Cash From Operating Activities"])
+            ni_row  = _get_row(fin, ["Net Income", "Net Income Common Stockholders"])
             if cfo_row is None or ni_row is None:
                 return None
             cfos = cfo_row.dropna()
@@ -990,8 +1004,10 @@ class SecondaryOverlayScreener:
             n = min(len(cfos), len(nis), 3)
             if n < 1:
                 return None
-            ratios = [float(cfos.iloc[i]) / float(nis.iloc[i])
-                      for i in range(n) if float(nis.iloc[i]) > 0]
+            ratios = [
+                float(cfos.iloc[i]) / float(nis.iloc[i])
+                for i in range(n) if float(nis.iloc[i]) > 0
+            ]
             return sum(ratios) / len(ratios) if ratios else None
         except Exception:
             return None
@@ -1002,21 +1018,26 @@ class SecondaryOverlayScreener:
             bs  = t.balance_sheet
             if fin is None or fin.empty or bs is None or bs.empty:
                 return None
-            ebit_row = self._get_row(fin, ["EBIT", "Operating Income"])
-            tax_prov = self._get_row(fin, ["Tax Provision", "Income Tax Expense"])
-            pbt_row  = self._get_row(fin, ["Pretax Income", "Income Before Tax"])
-            eq_row   = self._get_row(bs, ["Stockholders Equity", "Total Stockholders Equity",
-                                          "Common Stock Equity"])
-            debt_row = self._get_row(bs, ["Total Debt", "Long Term Debt And Capital Lease Obligation"])
-            cash_row = self._get_row(bs, ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"])
+            ebit_row = _get_row(fin, ["EBIT", "Operating Income"])
+            tax_prov = _get_row(fin, ["Tax Provision", "Income Tax Expense"])
+            pbt_row  = _get_row(fin, ["Pretax Income", "Income Before Tax"])
+            eq_row   = _get_row(bs, [
+                "Stockholders Equity", "Total Stockholders Equity",
+                "Common Stock Equity",
+            ])
+            debt_row = _get_row(bs, ["Total Debt", "Long Term Debt And Capital Lease Obligation"])
+            cash_row = _get_row(bs, [
+                "Cash And Cash Equivalents",
+                "Cash Cash Equivalents And Short Term Investments",
+            ])
 
             if ebit_row is None or eq_row is None:
                 return None
 
-            ebit  = float(ebit_row.dropna().iloc[0])
-            eq    = float(eq_row.dropna().iloc[0])
-            debt  = float(debt_row.dropna().iloc[0]) if debt_row is not None else 0
-            cash  = float(cash_row.dropna().iloc[0]) if cash_row is not None else 0
+            ebit = float(ebit_row.dropna().iloc[0])
+            eq   = float(eq_row.dropna().iloc[0])
+            debt = float(debt_row.dropna().iloc[0]) if debt_row is not None else 0
+            cash = float(cash_row.dropna().iloc[0]) if cash_row is not None else 0
 
             tax_rate = 0.25   # default
             if tax_prov is not None and pbt_row is not None:
@@ -1039,34 +1060,36 @@ class SecondaryOverlayScreener:
             bs  = t.balance_sheet
             if fin is None or fin.empty or bs is None or bs.empty:
                 return None
-            rev_row = self._get_row(fin, ["Total Revenue", "Revenue"])
-            ta_row  = self._get_row(bs, ["Total Assets"])
+            rev_row = _get_row(fin, ["Total Revenue", "Revenue"])
+            ta_row  = _get_row(bs, ["Total Assets"])
             if rev_row is None or ta_row is None:
                 return None
             return float(rev_row.dropna().iloc[0]) / float(ta_row.dropna().iloc[0])
         except Exception:
             return None
 
-    def _compute_cagrs(self, t: yf.Ticker) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    def _compute_cagrs(
+        self, t: yf.Ticker
+    ) -> tuple[Optional[float], Optional[float], Optional[float]]:
         rev3 = rev5 = ebitda3 = None
         try:
             fin = t.financials
             if fin is None or fin.empty:
                 return None, None, None
-            rev_row    = self._get_row(fin, ["Total Revenue", "Revenue"])
-            ebitda_row = self._get_row(fin, ["EBITDA", "Normalized EBITDA"])
+            rev_row    = _get_row(fin, ["Total Revenue", "Revenue"])
+            ebitda_row = _get_row(fin, ["EBITDA", "Normalized EBITDA"])
 
             if rev_row is not None:
                 revs = rev_row.dropna()
                 if len(revs) >= 4:
-                    rev3 = ((float(revs.iloc[0]) / float(revs.iloc[3])) ** (1/3) - 1) * 100
+                    rev3 = ((float(revs.iloc[0]) / float(revs.iloc[3])) ** (1 / 3) - 1) * 100
                 if len(revs) >= 6:
-                    rev5 = ((float(revs.iloc[0]) / float(revs.iloc[5])) ** (1/5) - 1) * 100
+                    rev5 = ((float(revs.iloc[0]) / float(revs.iloc[5])) ** (1 / 5) - 1) * 100
 
             if ebitda_row is not None:
                 ebs = ebitda_row.dropna()
                 if len(ebs) >= 4:
-                    ebitda3 = ((float(ebs.iloc[0]) / float(ebs.iloc[3])) ** (1/3) - 1) * 100
+                    ebitda3 = ((float(ebs.iloc[0]) / float(ebs.iloc[3])) ** (1 / 3) - 1) * 100
         except Exception:
             pass
         return rev3, rev5, ebitda3
@@ -1090,12 +1113,12 @@ class SecondaryOverlayScreener:
             return None
         near_ath = (high_52w - cmp) / high_52w <= 0.02   # within 2% of 52W high
         if not near_ath:
-            return None   # not at ATH — N/A
+            return None   # not at ATH -- N/A
         try:
             hist = yf.Ticker(ticker + NSE_SUFFIX).history(period="2mo")
             if hist.empty or len(hist) < 21:
                 return None
-            avg_vol = float(hist["Volume"].iloc[-21:-1].mean())
+            avg_vol   = float(hist["Volume"].iloc[-21:-1].mean())
             today_vol = float(hist["Volume"].iloc[-1])
             if avg_vol <= 0:
                 return None
@@ -1106,7 +1129,7 @@ class SecondaryOverlayScreener:
     def _check_rs_vs_nifty(self, ticker: str) -> Optional[bool]:
         try:
             stock_hist = yf.Ticker(ticker + NSE_SUFFIX).history(period="6mo")
-            nifty_hist = yf.Ticker(NIFTY_SYMBOL).history(period="6mo")
+            nifty_hist = yf.Ticker(NIFTY_50_SYMBOL).history(period="6mo")
             if stock_hist.empty or nifty_hist.empty or len(stock_hist) < 60:
                 return None
             stock_ret = float(stock_hist["Close"].iloc[-1] / stock_hist["Close"].iloc[0] - 1)
@@ -1114,13 +1137,6 @@ class SecondaryOverlayScreener:
             return stock_ret > nifty_ret
         except Exception:
             return None
-
-    @staticmethod
-    def _get_row(df, keys: list[str]):
-        for key in keys:
-            if key in df.index:
-                return df.loc[key]
-        return None
 
 
 # ── Orchestrator: CandidateScreener ──────────────────────────────────────────
@@ -1133,11 +1149,11 @@ class CandidateScreener:
     """
 
     def __init__(self) -> None:
-        self._stage2     = Stage2Checker()
-        self._ud         = UDRatioCalculator()
-        self._funds      = FundamentalScreener()
-        self._valuation  = ValuationStressTester()
-        self._secondary  = SecondaryOverlayScreener()
+        self._stage2    = Stage2Checker()
+        self._ud        = UDRatioCalculator()
+        self._funds     = FundamentalScreener()
+        self._valuation = ValuationStressTester()
+        self._secondary = SecondaryOverlayScreener()
 
     def screen(self, ticker: str) -> ScreeningResult:
         result = ScreeningResult(ticker=ticker)
@@ -1147,18 +1163,18 @@ class CandidateScreener:
         result.gate1 = g1
         if not g1.passed:
             result.first_failed_gate = "Gate 1 (Stage 2)"
-            result.recommendation = f"FAIL: {g1.stage_label} — {g1.notes}"
+            result.recommendation = f"FAIL: {g1.stage_label} -- {g1.notes}"
             return result
 
         # Gate 2
         g2 = self._ud.calculate(ticker)
         result.gate2 = g2
         if g2.disqualified:
-            result.first_failed_gate = "Gate 2 (U/D — Distribution)"
+            result.first_failed_gate = "Gate 2 (U/D -- Distribution)"
             result.recommendation = f"DISQUALIFY: {g2.notes}"
             return result
         if not g2.passed:
-            result.first_failed_gate = "Gate 2 (U/D — Weak)"
+            result.first_failed_gate = "Gate 2 (U/D -- Weak)"
             result.recommendation = f"FAIL: {g2.notes}"
             return result
 
@@ -1181,13 +1197,13 @@ class CandidateScreener:
         # 24-Parameter Secondary Overlay (advisory, never hard-fails)
         result.secondary = self._secondary.run(ticker)
 
-        manual_items = g34.manual_verify_fields
-        result.passed_all    = True
+        manual_items   = g34.manual_verify_fields
+        result.passed_all = True
         overlay_rating = result.secondary.overall_rating if result.secondary else "N/A"
         result.recommendation = (
-            f"ALL-CLEAR — Overlay: {overlay_rating}"
+            f"ALL-CLEAR -- Overlay: {overlay_rating}"
             if not manual_items
-            else f"ALL-CLEAR (manual verify: {', '.join(manual_items)}) — Overlay: {overlay_rating}"
+            else f"ALL-CLEAR (manual verify: {', '.join(manual_items)}) -- Overlay: {overlay_rating}"
         )
         return result
 
@@ -1197,27 +1213,31 @@ class CandidateScreener:
 class ScreeningRunner:
     """
     Loads watchlist tickers, runs CandidateScreener on each,
-    writes screening-results.md, and sends a Telegram summary.
+    writes screening-results.md, and sends a Telegram summary via an
+    injected TelegramNotifier.
     """
 
-    def __init__(self, portfolio_value: float = 0.0) -> None:
-        self._screener       = CandidateScreener()
-        self._sizer          = PositionSizer()
+    def __init__(
+        self,
+        notifier: TelegramNotifier,
+        portfolio_value: float = 0.0,
+    ) -> None:
+        self._screener        = CandidateScreener()
+        self._sizer           = PositionSizer()
+        self._notifier        = notifier
         self._portfolio_value = portfolio_value
-        self._bot_token      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-        self._chat_id        = os.environ.get("TELEGRAM_CHAT_ID", "")
 
     def run(self, tickers: Optional[list[str]] = None) -> list[ScreeningResult]:
         if tickers is None:
             tickers = self._load_watchlist()
 
         if not tickers:
-            logger.warning("No tickers to screen — check watchlist.md")
+            logger.warning("No tickers to screen -- check watchlist.md")
             return []
 
         results: list[ScreeningResult] = []
         for ticker in tickers:
-            logger.info("Screening %s …", ticker)
+            logger.info("Screening %s ...", ticker)
             try:
                 r = self._screener.screen(ticker)
             except Exception as exc:
@@ -1229,7 +1249,7 @@ class ScreeningRunner:
             results.append(r)
 
         self._write_results_md(results)
-        self._send_telegram(results)
+        self._notify(results)
         return results
 
     # ── I/O helpers ──────────────────────────────────────────────────────────
@@ -1263,11 +1283,11 @@ class ScreeningRunner:
     def _write_results_md(self, results: list[ScreeningResult]) -> None:
         ist = pytz.timezone("Asia/Kolkata")
         now = datetime.now(ist).strftime("%Y-%m-%d %H:%M IST")
-        passed   = [r for r in results if r.passed_all]
-        failed   = [r for r in results if not r.passed_all]
+        passed = [r for r in results if r.passed_all]
+        failed = [r for r in results if not r.passed_all]
 
         lines = [
-            f"# PMS Screening Results — {now}",
+            f"# PMS Screening Results -- {now}",
             "",
             f"Screened: {len(results)} | Passed all gates: {len(passed)} | Failed: {len(failed)}",
             "",
@@ -1281,13 +1301,13 @@ class ScreeningRunner:
             g2  = self._fmt_ud(r.gate2)
             g34 = self._fmt_gate(r.gate3_gate4)
             pe  = self._fmt_gate(r.pe_stress)
-            status = "✅ PASS" if r.passed_all else f"❌ {r.first_failed_gate}"
+            status = "PASS" if r.passed_all else f"FAIL: {r.first_failed_gate}"
             lines.append(f"| {r.ticker} | {g1} | {g2} | {g34} | {pe} | {status} |")
 
         lines += ["", "## Ready to Acquire (All Gates Passed)", ""]
         if passed:
             lines += [
-                "| Ticker | Entry (CMP) | SL (−9%) | Rec. Shares | Position Value | Risk % | Overlay | Notes |",
+                "| Ticker | Entry (CMP) | SL (-9%) | Rec. Shares | Position Value | Risk % | Overlay | Notes |",
                 "|--------|-------------|---------|-------------|---------------|--------|---------|-------|",
             ]
             for r in passed:
@@ -1296,13 +1316,13 @@ class ScreeningRunner:
                 if cmp and self._portfolio_value > 0:
                     size = self._sizer.size(r.ticker, self._portfolio_value, cmp)
                     lines.append(
-                        f"| {r.ticker} | ₹{cmp:.1f} | ₹{size.sl_price:.1f} | "
-                        f"{size.recommended_shares} | ₹{size.position_value:,.0f} | "
+                        f"| {r.ticker} | Rs{cmp:.1f} | Rs{size.sl_price:.1f} | "
+                        f"{size.recommended_shares} | Rs{size.position_value:,.0f} | "
                         f"{size.effective_risk_pct:.2f}% | {overlay_rating} | {size.notes[:55]} |"
                     )
                 else:
                     lines.append(
-                        f"| {r.ticker} | ₹{cmp:.1f if cmp else '?'} | — | — | — | — | "
+                        f"| {r.ticker} | Rs{cmp:.1f if cmp else '?'} | -- | -- | -- | -- | "
                         f"{overlay_rating} | Set PORTFOLIO_VALUE_INR env var |"
                     )
 
@@ -1312,20 +1332,27 @@ class ScreeningRunner:
                 if not r.secondary:
                     continue
                 s = r.secondary
-                lines.append(f"#### {r.ticker} — {s.overall_rating} "
-                             f"({s.pass_count}✅ {s.fail_count}❌ {s.manual_count}⚠ {s.na_count} N/A)")
+                lines.append(
+                    f"#### {r.ticker} -- {s.overall_rating} "
+                    f"({s.pass_count} PASS  {s.fail_count} FAIL  {s.manual_count} MANUAL  {s.na_count} N/A)"
+                )
                 lines.append("")
                 lines.append("| # | Parameter | Category | Value | Threshold | Status |")
                 lines.append("|---|-----------|----------|-------|-----------|--------|")
                 for i, p in enumerate(s.params, 1):
-                    val_str = f"{p.value}" if p.value is not None else "—"
-                    status_icon = {"PASS": "✅", "FAIL": "❌", "MANUAL_VERIFY": "⚠️", "N/A": "—"}.get(p.status, p.status)
+                    val_str = f"{p.value}" if p.value is not None else "--"
+                    status_icon = {
+                        "PASS": "PASS",
+                        "FAIL": "FAIL",
+                        "MANUAL_VERIFY": "MANUAL",
+                        "N/A": "N/A",
+                    }.get(p.status, p.status)
                     lines.append(
                         f"| {i} | {p.name} | {p.category} | {val_str} | {p.threshold} | {status_icon} |"
                     )
                 lines.append("")
         else:
-            lines.append("None — no candidates passed all gates today.")
+            lines.append("None -- no candidates passed all gates today.")
 
         lines += ["", "## Failed / Flagged", ""]
         for r in failed:
@@ -1334,16 +1361,12 @@ class ScreeningRunner:
                 manual = f" [Manual Verify: {', '.join(r.gate3_gate4.manual_verify_fields)}]"
             lines.append(f"- **{r.ticker}**: {r.recommendation}{manual}")
 
-        os.makedirs(os.path.dirname(SCREENING_RESULTS_PATH), exist_ok=True)
-        with open(SCREENING_RESULTS_PATH, "w") as f:
+        os.makedirs(os.path.dirname(SCREENING_RESULTS), exist_ok=True)
+        with open(SCREENING_RESULTS, "w") as f:
             f.write("\n".join(lines) + "\n")
-        logger.info("Wrote %s", SCREENING_RESULTS_PATH)
+        logger.info("Wrote %s", SCREENING_RESULTS)
 
-    def _send_telegram(self, results: list[ScreeningResult]) -> None:
-        if not self._bot_token or not self._chat_id:
-            logger.warning("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — skipping notification")
-            return
-
+    def _notify(self, results: list[ScreeningResult]) -> None:
         ist = pytz.timezone("Asia/Kolkata")
         now = datetime.now(ist).strftime("%d %b %Y %H:%M IST")
         passed = [r for r in results if r.passed_all]
@@ -1366,67 +1389,47 @@ class ScreeningRunner:
 
         msg_parts.append("\nFull results: references/screening-results.md")
         message = "\n".join(msg_parts)
-
-        url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
-        try:
-            resp = requests.post(
-                url,
-                json={"chat_id": self._chat_id, "text": message},
-                timeout=10,
-            )
-            data = resp.json()
-            if data.get("ok"):
-                logger.info("Telegram notification sent")
-            else:
-                logger.error("Telegram error: %s", data)
-        except Exception as exc:
-            logger.error("Telegram send failed: %s", exc)
+        self._notifier.send_chunked(message, parse_mode="HTML")
 
     @staticmethod
     def _fmt_gate(gate) -> str:
         if gate is None:
-            return "—"
-        return "✅" if gate.passed else "❌"
+            return "--"
+        return "PASS" if gate.passed else "FAIL"
 
     @staticmethod
     def _fmt_ud(gate: Optional[UDRatioResult]) -> str:
         if gate is None:
-            return "—"
+            return "--"
         if gate.disqualified:
-            return f"❌ DIST({gate.ud_50:.2f})" if gate.ud_50 else "❌ DIST"
+            return f"DIST({gate.ud_50:.2f})" if gate.ud_50 else "DIST"
         if not gate.passed:
-            return f"❌ WEAK({gate.ud_50:.2f})" if gate.ud_50 else "❌ WEAK"
-        flag = " ⚠️" if gate.distribution_flag else ""
-        return f"✅({gate.ud_50:.2f}){flag}"
+            return f"WEAK({gate.ud_50:.2f})" if gate.ud_50 else "WEAK"
+        flag = " DIST_FLAG" if gate.distribution_flag else ""
+        return f"PASS({gate.ud_50:.2f}){flag}"
 
 
-# ── CLI entry-point ───────────────────────────────────────────────────────────
+# ── Module-level convenience function ────────────────────────────────────────
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="PMS candidate screener")
-    parser.add_argument(
-        "--tickers",
-        type=str,
-        default="",
-        help="Comma-separated list of NSE tickers to screen (overrides watchlist.md)",
-    )
-    parser.add_argument(
-        "--portfolio-value",
-        type=float,
-        default=float(os.environ.get("PORTFOLIO_VALUE_INR", "0")),
-        help="Current portfolio value in INR for position sizing",
-    )
-    args = parser.parse_args()
+def screen(
+    portfolio_value_inr: float = 0,
+    tickers: Optional[list[str]] = None,
+) -> list[ScreeningResult]:
+    """
+    Wire up dependencies and run the full screening pipeline.
 
-    tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()] or None
-    runner = ScreeningRunner(portfolio_value=args.portfolio_value)
-    results = runner.run(tickers=tickers)
+    Args:
+        portfolio_value_inr: Current portfolio value in INR for position sizing.
+            Falls back to PORTFOLIO_VALUE_INR environment variable, then 0.
+        tickers: Optional explicit list of NSE ticker symbols (without .NS suffix).
+            If None, tickers are loaded from WATCHLIST_PATH.
 
-    passed = [r for r in results if r.passed_all]
-    logger.info(
-        "Screening complete: %d/%d passed all gates", len(passed), len(results)
-    )
+    Returns:
+        List of ScreeningResult, one per ticker screened.
+    """
+    if portfolio_value_inr == 0:
+        portfolio_value_inr = float(os.environ.get("PORTFOLIO_VALUE_INR", "0"))
 
-
-if __name__ == "__main__":
-    main()
+    notifier = TelegramNotifier()
+    runner = ScreeningRunner(notifier=notifier, portfolio_value=portfolio_value_inr)
+    return runner.run(tickers=tickers)
