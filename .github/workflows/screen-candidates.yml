@@ -21,6 +21,8 @@ on:
 jobs:
   screen:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -47,4 +49,4 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .claude/skills/portfolio-cockpit/references/screening-results.md
           git diff --staged --quiet || git commit -m "chore: update PMS screening results $(date '+%Y-%m-%d') [skip ci]"
-          git push
+          git push origin HEAD
