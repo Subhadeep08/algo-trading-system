@@ -29,7 +29,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install dependencies
-        run: pip install yfinance requests anthropic pytz
+        run: pip install -r requirements.txt
       - name: Run PMS Candidate Screener
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -39,9 +39,9 @@ jobs:
         run: |
           TICKERS="${{ inputs.tickers }}"
           if [ -n "$TICKERS" ]; then
-            python scripts/screen_candidates.py --tickers "$TICKERS" --portfolio-value "$PORTFOLIO_VALUE_INR"
+            python scripts/run_screener.py --tickers "$TICKERS"
           else
-            python scripts/screen_candidates.py --portfolio-value "$PORTFOLIO_VALUE_INR"
+            python scripts/run_screener.py
           fi
       - name: Commit screening results
         run: |
