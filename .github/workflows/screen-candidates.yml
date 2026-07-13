@@ -36,6 +36,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PORTFOLIO_VALUE_INR: ${{ inputs.portfolio_value || secrets.PORTFOLIO_VALUE_INR || '0' }}
+          SCREENER_IN_SESSION: ${{ secrets.SCREENER_IN_SESSION }}
         run: |
           TICKERS="${{ inputs.tickers }}"
           if [ -n "$TICKERS" ]; then

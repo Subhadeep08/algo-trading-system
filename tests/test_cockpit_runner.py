@@ -1,18 +1,16 @@
-"""Tests for scripts/cockpit_runner.py — snapshots, SL classification, RS, allocation."""
+"""Tests for cockpit/runner.py — snapshots, SL classification, RS, allocation, requalifier."""
 from __future__ import annotations
 
 import pytest
 
-from cockpit_runner import (
-    CockpitReportBuilder,
-    GttOrderSnapshot,
-    HoldingRequalifier,
-    HoldingSnapshot,
+from cockpit.config import (
     SL_DANGER_BUFFER_PCT,
     SL_MONITOR_BUFFER_PCT,
-    UNDERPERFORMER_PNL_THRESHOLD_PCT,
-    WINNER_PNL_THRESHOLD_PCT,
+    UNDERPERFORMER_PNL_PCT,
+    WINNER_PNL_PCT,
 )
+from cockpit.models import GttOrderSnapshot, HoldingSnapshot
+from cockpit.runner import HoldingRequalifier, ReportFormatter
 
 
 # ── HoldingSnapshot computed properties ──────────────────────────────────────
@@ -77,8 +75,11 @@ class TestHoldingSnapshot:
 class TestGttOrderSnapshot:
     def _snap(self, current=1050.0, trigger=1000.0, target=1300.0):
         return GttOrderSnapshot(
-            ticker="GTT", current_price=current,
-            trigger_price=trigger, target_price=target,
+            ticker="GTT",
+            current_price=current,
+            trigger_price=trigger,
+            target_price=target,
+            quantity=0,
         )
 
     def test_distance_to_trigger_positive(self):
@@ -99,7 +100,7 @@ class TestGttOrderSnapshot:
         assert self._snap(current=1010.0, trigger=1000.0).is_trigger_breached is False
 
 
-# ── CockpitReportBuilder._classify_sl_status ─────────────────────────────────
+# ── ReportFormatter._sl_status ───────────────────────────────────────────────
 
 class TestClassifySlStatus:
     def _snap(self, current, sl):
@@ -109,133 +110,109 @@ class TestClassifySlStatus:
         )
 
     def _run(self, current, sl):
-        critical, normal, actions = [], [], []
-        CockpitReportBuilder()._classify_sl_status(
-            self._snap(current, sl), critical, normal, actions
-        )
-        return critical, normal, actions
+        return ReportFormatter._sl_status(self._snap(current, sl))
 
-    def test_breached_goes_to_critical_with_action(self):
-        critical, normal, actions = self._run(current=78.0, sl=80.0)
-        assert len(critical) == 1
-        assert "BREACHED" in critical[0]
-        assert len(actions) == 1
-        assert "EXIT" in actions[0]
+    def test_breached_goes_to_priority_zero(self):
+        priority, label = self._run(current=78.0, sl=80.0)
+        assert priority == 0
+        assert "BREACHED" in label
 
     def test_danger_zone_buffer_below_danger_threshold(self):
         # buffer = (81 - 80) / 80 * 100 = 1.25% < SL_DANGER_BUFFER_PCT (2%)
-        critical, normal, actions = self._run(current=81.0, sl=80.0)
-        assert len(critical) == 1
-        assert "DANGER" in critical[0]
-        assert "TIGHT SL" in actions[0]
+        priority, label = self._run(current=81.0, sl=80.0)
+        assert priority == 1
+        assert "DANGER" in label
 
     def test_monitor_zone_buffer_between_danger_and_monitor(self):
         # buffer ≈ 3.75% → between 2% and 5%
-        critical, normal, actions = self._run(current=83.0, sl=80.0)
-        assert len(normal) == 1
-        assert "Monitor" in normal[0]
-        assert len(actions) == 0
+        priority, label = self._run(current=83.0, sl=80.0)
+        assert priority == 2
+        assert "Monitor" in label
 
     def test_safe_buffer_above_monitor_threshold(self):
         # buffer = (90 - 80) / 80 * 100 = 12.5% > SL_MONITOR_BUFFER_PCT (5%)
-        critical, normal, actions = self._run(current=90.0, sl=80.0)
-        assert len(normal) == 1
-        assert "Safe" in normal[0]
-        assert len(actions) == 0
+        priority, label = self._run(current=90.0, sl=80.0)
+        assert priority == 3
+        assert "Safe" in label
 
 
-# ── CockpitReportBuilder._classify_relative_strength ─────────────────────────
+# ── ReportFormatter._rs_status ───────────────────────────────────────────────
 
 class TestClassifyRelativeStrength:
     def _classify(self, stock_pct, nifty_pct):
-        action_items = []
-        label = CockpitReportBuilder._classify_relative_strength(
-            stock_day_change_pct=stock_pct,
-            nifty_day_change_pct=nifty_pct,
-            ticker="T",
-            action_items=action_items,
-        )
-        return label, action_items
+        return ReportFormatter._rs_status(stock_pct, nifty_pct)
 
     def test_outperformer_stock_green_nifty_flat(self):
-        label, _ = self._classify(stock_pct=1.5, nifty_pct=0.0)
+        label = self._classify(stock_pct=1.5, nifty_pct=0.0)
         assert "Outperformer" in label
 
     def test_outperformer_stock_green_nifty_red(self):
-        label, _ = self._classify(stock_pct=0.5, nifty_pct=-0.3)
+        label = self._classify(stock_pct=0.5, nifty_pct=-0.3)
         assert "Outperformer" in label
 
     def test_underperformer_stock_red_nifty_green(self):
-        label, actions = self._classify(stock_pct=-1.0, nifty_pct=0.5)
+        label = self._classify(stock_pct=-1.0, nifty_pct=0.5)
         assert "Underperformer" in label
-        assert len(actions) == 1
-        assert "WATCH" in actions[0]
 
     def test_inline_both_positive(self):
-        label, actions = self._classify(stock_pct=0.5, nifty_pct=0.4)
+        label = self._classify(stock_pct=0.5, nifty_pct=0.4)
         assert "In-line" in label
-        assert len(actions) == 0
 
     def test_inline_both_negative(self):
-        label, _ = self._classify(stock_pct=-0.3, nifty_pct=-0.8)
+        label = self._classify(stock_pct=-0.3, nifty_pct=-0.8)
         assert "In-line" in label
 
     def test_nifty_unavailable_returns_na(self):
-        label, _ = self._classify(stock_pct=1.0, nifty_pct=None)
+        label = self._classify(stock_pct=1.0, nifty_pct=None)
         assert "N/A" in label
 
 
-# ── CockpitReportBuilder._build_capital_allocation_section ───────────────────
+# ── ReportFormatter._capital_status ──────────────────────────────────────────
 
 class TestCapitalAllocationSection:
-    def _snap(self, current, cost, ticker="T"):
-        return HoldingSnapshot(
-            ticker=ticker, current_price=current, previous_close=90.0,
-            quantity=10, average_cost=cost, stop_loss_price=80.0, target_price=130.0,
-        )
-
-    def _run(self, snaps_by_ticker: dict):
-        action_items = []
-        rows = CockpitReportBuilder()._build_capital_allocation_section(
-            snaps_by_ticker, action_items
-        )
-        return rows, action_items
-
     def test_winner_label_above_threshold(self):
-        rows, _ = self._run({"A": self._snap(current=120.0, cost=100.0)})
-        assert "Winner" in rows[0]
+        # pnl = +20% > WINNER_PNL_PCT (15%)
+        label = ReportFormatter._capital_status(20.0)
+        assert "Winner" in label
 
     def test_near_cost_label_within_band(self):
-        rows, _ = self._run({"A": self._snap(current=103.0, cost=100.0)})
-        assert "Near cost" in rows[0]
+        # pnl = +3% within NEAR_COST_BAND_PCT (5%)
+        label = ReportFormatter._capital_status(3.0)
+        assert "Near cost" in label
 
-    def test_underperformer_label_and_action_below_threshold(self):
-        rows, actions = self._run({"A": self._snap(current=85.0, cost=100.0)})
-        assert "Underperformer" in rows[0]
-        assert any("REVIEW" in a for a in actions)
+    def test_underperformer_label_below_threshold(self):
+        # pnl = -15% < UNDERPERFORMER_PNL_PCT (-10%)
+        label = ReportFormatter._capital_status(-15.0)
+        assert "Underperformer" in label
 
-    def test_none_snapshot_shows_unavailable(self):
-        rows, _ = self._run({"A": None})
-        assert "UNAVAILABLE" in rows[0]
+    def test_none_snapshot_shows_price_fetch_failed(self):
+        msg = ReportFormatter.phase1_message(
+            date_str="2026-01-01",
+            gift_nifty="N/A",
+            gtt_snapshots={},
+            fii_dii="N/A",
+            holding_snapshots={"A": None},
+        )
+        assert "price fetch failed" in msg
 
 
-# ── CockpitReportBuilder._format_numbered_action_items ───────────────────────
+# ── ReportFormatter._format_numbered_action_items ────────────────────────────
 
 class TestFormatNumberedActionItems:
     def test_empty_returns_default_message(self):
-        out = CockpitReportBuilder._format_numbered_action_items([])
+        out = ReportFormatter._format_numbered_action_items([])
         assert out == "CLEAN — No action required"
 
     def test_custom_empty_message(self):
-        out = CockpitReportBuilder._format_numbered_action_items([], empty_message="ALL GOOD")
+        out = ReportFormatter._format_numbered_action_items([], empty_message="ALL GOOD")
         assert out == "ALL GOOD"
 
     def test_single_item_numbered(self):
-        out = CockpitReportBuilder._format_numbered_action_items(["Do this"])
+        out = ReportFormatter._format_numbered_action_items(["Do this"])
         assert out == "1. Do this"
 
     def test_multiple_items_numbered(self):
-        out = CockpitReportBuilder._format_numbered_action_items(["Alpha", "Beta", "Gamma"])
+        out = ReportFormatter._format_numbered_action_items(["Alpha", "Beta", "Gamma"])
         lines = out.splitlines()
         assert lines[0].startswith("1.")
         assert lines[1].startswith("2.")
@@ -245,8 +222,6 @@ class TestFormatNumberedActionItems:
 # ── HoldingRequalifier._classify ─────────────────────────────────────────────
 
 class TestHoldingRequalifierClassify:
-    """Tests the 6 classification branches using simple mock gate results."""
-
     class _G1:
         def __init__(self, passed, stage_label, ma_150=None):
             self.passed = passed
@@ -254,7 +229,8 @@ class TestHoldingRequalifierClassify:
             self.ma_150 = ma_150
 
     class _G2:
-        def __init__(self, passed, disqualified=False, distribution_flag=False, ud_50=1.3, ud_21=1.1):
+        def __init__(self, passed, disqualified=False, distribution_flag=False,
+                     ud_50=1.3, ud_21=1.1):
             self.passed = passed
             self.disqualified = disqualified
             self.distribution_flag = distribution_flag

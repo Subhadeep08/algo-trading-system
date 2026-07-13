@@ -10,15 +10,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from conftest import make_ohlcv, make_financial_df, make_quarterly_df, make_mock_ticker
-from screen_candidates import (
+from cockpit.config import (
     ANNUAL_PROFIT_GROWTH_MIN,
     DE_RATIO_MAX,
     EBITDA_CFO_MIN_RATIO,
-    GTT_TRAILING_STOP_SLABS,
     MAX_POSITION_PCT,
     PE_STRESS_RETRACEMENT_MAX,
     QUARTERLY_EPS_GROWTH_MIN,
-    QUARTERLY_REV_GROWTH_MIN,
     RISK_PER_TRADE_PCT,
     ROCE_MIN_PCT,
     SL_BELOW_ENTRY_PCT,
@@ -26,10 +24,14 @@ from screen_candidates import (
     UD_DISTRIBUTION_THRESHOLD,
     UD_ENTRY_THRESHOLD,
     UD_LOOKBACK_50,
+)
+from cockpit.models import ScreeningResult
+from cockpit.screener import (
+    GTT_TRAILING_STOP_SLABS,
+    QUARTERLY_REV_GROWTH_MIN,
     CandidateScreener,
     FundamentalScreener,
     PositionSizer,
-    ScreeningResult,
     ScreeningRunner,
     Stage2Checker,
     UDRatioCalculator,
@@ -45,7 +47,7 @@ class TestStage2Checker:
     def _check(self, closes):
         hist = make_ohlcv(len(closes), closes)
         mock = make_mock_ticker(history_1y=hist)
-        with patch("screen_candidates.yf.Ticker", return_value=mock):
+        with patch("cockpit.screener.yf.Ticker", return_value=mock):
             return Stage2Checker().check("DUMMY")
 
     def test_insufficient_data_fails(self):
@@ -93,7 +95,7 @@ class TestStage2Checker:
         assert result.passed is False
 
     def test_data_error_returns_failed_result(self):
-        with patch("screen_candidates.yf.Ticker", side_effect=Exception("network error")):
+        with patch("cockpit.screener.yf.Ticker", side_effect=Exception("network error")):
             result = Stage2Checker().check("DUMMY")
         assert result.passed is False
         assert "DATA ERROR" in result.notes
@@ -108,7 +110,7 @@ class TestUDRatioCalculator:
         n = len(closes)
         hist = make_ohlcv(n, closes, opens=opens, volume=volume)
         mock = make_mock_ticker(history_3mo=hist)
-        with patch("screen_candidates.yf.Ticker", return_value=mock):
+        with patch("cockpit.screener.yf.Ticker", return_value=mock):
             return UDRatioCalculator().calculate("DUMMY")
 
     def _all_up_days(self, n=60):
@@ -138,7 +140,7 @@ class TestUDRatioCalculator:
         hist = make_ohlcv(n, closes, opens=opens)
         hist["Volume"] = volumes
         mock = make_mock_ticker(history_3mo=hist)
-        with patch("screen_candidates.yf.Ticker", return_value=mock):
+        with patch("cockpit.screener.yf.Ticker", return_value=mock):
             result = UDRatioCalculator().calculate("DUMMY")
         assert result.passed is True
         assert result.ud_50 is not None
@@ -160,7 +162,7 @@ class TestUDRatioCalculator:
         hist = make_ohlcv(n, closes, opens=opens)
         hist["Volume"] = volumes
         mock = make_mock_ticker(history_3mo=hist)
-        with patch("screen_candidates.yf.Ticker", return_value=mock):
+        with patch("cockpit.screener.yf.Ticker", return_value=mock):
             result = UDRatioCalculator().calculate("DUMMY")
         # U/D_50 = 30*1000 / 30*1100 = 0.909 → between 0.75 and 1.25 → weak (not pass, not disqualified)
         assert not result.passed
@@ -178,12 +180,12 @@ class TestUDRatioCalculator:
         hist = make_ohlcv(n, closes, opens=opens)
         hist["Volume"] = volumes
         mock = make_mock_ticker(history_3mo=hist)
-        with patch("screen_candidates.yf.Ticker", return_value=mock):
+        with patch("cockpit.screener.yf.Ticker", return_value=mock):
             result = UDRatioCalculator().calculate("DUMMY")
         assert result.distribution_flag is True
 
     def test_data_error_returns_failed_result(self):
-        with patch("screen_candidates.yf.Ticker", side_effect=Exception("timeout")):
+        with patch("cockpit.screener.yf.Ticker", side_effect=Exception("timeout")):
             result = UDRatioCalculator().calculate("DUMMY")
         assert result.passed is False
         assert "DATA ERROR" in result.notes
@@ -252,7 +254,7 @@ class TestFundamentalScreener:
         )
 
     def _screen(self, mock_ticker):
-        with patch("screen_candidates.yf.Ticker", return_value=mock_ticker):
+        with patch("cockpit.screener.yf.Ticker", return_value=mock_ticker):
             return FundamentalScreener().screen("DUMMY")
 
     def test_all_gates_pass(self):
@@ -328,7 +330,7 @@ class TestValuationStressTester:
             "forwardEps": fwd_eps,
         }
         mock = make_mock_ticker(info=info)
-        with patch("screen_candidates.yf.Ticker", return_value=mock):
+        with patch("cockpit.screener.yf.Ticker", return_value=mock):
             return ValuationStressTester().stress_test("DUMMY")
 
     def test_passes_within_10_pct_of_high(self):
@@ -358,12 +360,12 @@ class TestValuationStressTester:
 
     def test_missing_cmp_fails_gracefully(self):
         mock = make_mock_ticker(info={})
-        with patch("screen_candidates.yf.Ticker", return_value=mock):
+        with patch("cockpit.screener.yf.Ticker", return_value=mock):
             result = ValuationStressTester().stress_test("DUMMY")
         assert result.passed is False
 
     def test_data_error_fails_gracefully(self):
-        with patch("screen_candidates.yf.Ticker", side_effect=Exception("err")):
+        with patch("cockpit.screener.yf.Ticker", side_effect=Exception("err")):
             result = ValuationStressTester().stress_test("DUMMY")
         assert result.passed is False
         assert "DATA ERROR" in result.notes
@@ -547,7 +549,7 @@ class TestLoadWatchlist:
         wl = tmp_path / "watchlist.md"
         wl.write_text(self.WATCHLIST_CONTENT)
         runner = ScreeningRunner.__new__(ScreeningRunner)
-        with patch("screen_candidates.WATCHLIST_PATH", str(wl)):
+        with patch("cockpit.screener.WATCHLIST_PATH", str(wl)):
             tickers = runner._load_watchlist()
         assert "DIXON" in tickers
         assert "POLYCAB" in tickers
@@ -557,7 +559,7 @@ class TestLoadWatchlist:
         wl = tmp_path / "watchlist.md"
         wl.write_text(self.WATCHLIST_CONTENT)
         runner = ScreeningRunner.__new__(ScreeningRunner)
-        with patch("screen_candidates.WATCHLIST_PATH", str(wl)):
+        with patch("cockpit.screener.WATCHLIST_PATH", str(wl)):
             tickers = runner._load_watchlist()
         assert "—" not in tickers
 
@@ -565,7 +567,7 @@ class TestLoadWatchlist:
         wl = tmp_path / "watchlist.md"
         wl.write_text(self.WATCHLIST_CONTENT)
         runner = ScreeningRunner.__new__(ScreeningRunner)
-        with patch("screen_candidates.WATCHLIST_PATH", str(wl)):
+        with patch("cockpit.screener.WATCHLIST_PATH", str(wl)):
             tickers = runner._load_watchlist()
         # DIXON appears in "Latest Gate Scores" too — should only appear once
         assert tickers.count("DIXON") == 1
@@ -575,12 +577,12 @@ class TestLoadWatchlist:
         wl = tmp_path / "watchlist.md"
         wl.write_text(content)
         runner = ScreeningRunner.__new__(ScreeningRunner)
-        with patch("screen_candidates.WATCHLIST_PATH", str(wl)):
+        with patch("cockpit.screener.WATCHLIST_PATH", str(wl)):
             tickers = runner._load_watchlist()
         assert tickers == []
 
     def test_missing_file_returns_empty_list(self, tmp_path):
         runner = ScreeningRunner.__new__(ScreeningRunner)
-        with patch("screen_candidates.WATCHLIST_PATH", str(tmp_path / "nonexistent.md")):
+        with patch("cockpit.screener.WATCHLIST_PATH", str(tmp_path / "nonexistent.md")):
             tickers = runner._load_watchlist()
         assert tickers == []

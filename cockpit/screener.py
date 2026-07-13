@@ -50,6 +50,7 @@ from cockpit.config import (
     UD_LOOKBACK_21,
     UD_LOOKBACK_50,
 )
+from cockpit.screener_in import ScreenerInClient, ScreenerInData
 from cockpit.telegram import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -362,14 +363,16 @@ class FundamentalScreener:
       4-C: Current quarter EPS/revenue growth >= 25% YoY
     """
 
-    def screen(self, ticker: str) -> FundamentalResult:
+    def screen(
+        self, ticker: str, screener_data: Optional[ScreenerInData] = None
+    ) -> FundamentalResult:
         ns_ticker = ticker + NSE_SUFFIX
         t = yf.Ticker(ns_ticker)
         manual_verify: list[str] = []
         fail_reasons: list[str] = []
 
         # ── Gate 3: EBITDA-to-CFO ────────────────────────────────────────────
-        ebitda_cfo_ratio = self._compute_ebitda_cfo(t)
+        ebitda_cfo_ratio = self._compute_ebitda_cfo(t, screener_data)
 
         gate3_pass = True
         if ebitda_cfo_ratio is None:
@@ -379,7 +382,7 @@ class FundamentalScreener:
             fail_reasons.append(f"EBITDA-CFO={ebitda_cfo_ratio:.2f} < {EBITDA_CFO_MIN_RATIO}")
 
         # ── Gate 4-A: Annual PAT CAGR ────────────────────────────────────────
-        annual_cagr = self._compute_annual_pat_cagr(t)
+        annual_cagr = self._compute_annual_pat_cagr(t, screener_data)
         gate4a_pass = True
         if annual_cagr is None:
             manual_verify.append("Annual PAT CAGR")
@@ -388,7 +391,7 @@ class FundamentalScreener:
             fail_reasons.append(f"PAT CAGR={annual_cagr:.1f}% < {ANNUAL_PROFIT_GROWTH_MIN}%")
 
         # ── Gate 4-B: Balance sheet ratios ───────────────────────────────────
-        de_ratio, roce_pct = self._compute_balance_sheet_ratios(t)
+        de_ratio, roce_pct = self._compute_balance_sheet_ratios(t, screener_data)
         gate4b_pass = True
         if de_ratio is None:
             manual_verify.append("D/E ratio")
@@ -402,7 +405,7 @@ class FundamentalScreener:
             fail_reasons.append(f"ROCE={roce_pct:.1f}% < {ROCE_MIN_PCT}%")
 
         # ── Gate 4-C: Quarterly growth ───────────────────────────────────────
-        eps_growth, rev_growth = self._compute_quarterly_growth(t)
+        eps_growth, rev_growth = self._compute_quarterly_growth(t, screener_data)
         gate4c_pass = True
         if eps_growth is None:
             manual_verify.append("Quarterly EPS growth")
@@ -431,7 +434,20 @@ class FundamentalScreener:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
-    def _compute_ebitda_cfo(self, t: yf.Ticker) -> Optional[float]:
+    def _compute_ebitda_cfo(
+        self, t: yf.Ticker, screener_data: Optional[ScreenerInData] = None
+    ) -> Optional[float]:
+        # Try Screener.in first (most reliable for NSE stocks)
+        if screener_data is not None:
+            try:
+                if screener_data.annual_ebitda and screener_data.annual_cfo:
+                    ebitda_val = screener_data.annual_ebitda[0]
+                    cfo_val = screener_data.annual_cfo[0]
+                    if ebitda_val and ebitda_val > 0:
+                        return cfo_val / ebitda_val
+            except Exception:
+                pass
+
         try:
             cf = t.cashflow
             if cf is None or cf.empty:
@@ -458,7 +474,19 @@ class FundamentalScreener:
         except Exception:
             return None
 
-    def _compute_annual_pat_cagr(self, t: yf.Ticker) -> Optional[float]:
+    def _compute_annual_pat_cagr(
+        self, t: yf.Ticker, screener_data: Optional[ScreenerInData] = None
+    ) -> Optional[float]:
+        # Try Screener.in first
+        if screener_data is not None:
+            try:
+                pats = screener_data.annual_net_profit
+                if len(pats) >= 4 and pats[3] and pats[3] > 0:
+                    cagr = ((pats[0] / pats[3]) ** (1 / 3) - 1) * 100
+                    return cagr
+            except Exception:
+                pass
+
         try:
             fin = t.financials
             if fin is None or fin.empty:
@@ -479,8 +507,17 @@ class FundamentalScreener:
             return None
 
     def _compute_balance_sheet_ratios(
-        self, t: yf.Ticker
+        self,
+        t: yf.Ticker,
+        screener_data: Optional[ScreenerInData] = None,
     ) -> tuple[Optional[float], Optional[float]]:
+        # Try Screener.in first — pre-calculated ratios are more reliable for NSE
+        if screener_data is not None:
+            de = screener_data.de_ratio
+            roce = screener_data.roce_pct
+            if de is not None or roce is not None:
+                return de, roce
+
         de_ratio = None
         roce_pct = None
         try:
@@ -521,8 +558,29 @@ class FundamentalScreener:
         return de_ratio, roce_pct
 
     def _compute_quarterly_growth(
-        self, t: yf.Ticker
+        self,
+        t: yf.Ticker,
+        screener_data: Optional[ScreenerInData] = None,
     ) -> tuple[Optional[float], Optional[float]]:
+        # Try Screener.in first
+        if screener_data is not None:
+            eps_growth = None
+            rev_growth = None
+            try:
+                eps_vals = screener_data.quarterly_eps
+                if len(eps_vals) >= 5 and eps_vals[4] and eps_vals[4] != 0:
+                    eps_growth = ((eps_vals[0] - eps_vals[4]) / abs(eps_vals[4])) * 100
+            except Exception:
+                pass
+            try:
+                rev_vals = screener_data.quarterly_sales
+                if len(rev_vals) >= 5 and rev_vals[4] and rev_vals[4] != 0:
+                    rev_growth = ((rev_vals[0] - rev_vals[4]) / abs(rev_vals[4])) * 100
+            except Exception:
+                pass
+            if eps_growth is not None or rev_growth is not None:
+                return eps_growth, rev_growth
+
         eps_growth = None
         rev_growth = None
         try:
@@ -675,7 +733,9 @@ class SecondaryOverlayScreener:
     Flags items as PASS / FAIL / MANUAL_VERIFY / N/A.
     """
 
-    def run(self, ticker: str) -> SecondaryOverlayResult:
+    def run(
+        self, ticker: str, screener_data: Optional[ScreenerInData] = None
+    ) -> SecondaryOverlayResult:
         ns_ticker = ticker + NSE_SUFFIX
         t = yf.Ticker(ns_ticker)
         try:
@@ -686,8 +746,14 @@ class SecondaryOverlayScreener:
         params: list[OverlayParamResult] = []
 
         # ── Category 1: Valuation & Pricing ──────────────────────────────────
+        # #1 Trailing P/E: prefer Screener.in (more reliable for NSE)
+        _trailing_pe = (
+            screener_data.current_pe
+            if (screener_data and screener_data.current_pe is not None)
+            else info.get("trailingPE")
+        )
         params.append(self._check_scalar(
-            info.get("trailingPE"), "Trailing P/E", "Valuation",
+            _trailing_pe, "Trailing P/E", "Valuation",
             f"< {TRAILING_PE_MAX:.0f}x (unless EPS growth >40%)",
             lambda v: v < TRAILING_PE_MAX,
         ))
@@ -701,8 +767,14 @@ class SecondaryOverlayScreener:
             f"< {EV_EBITDA_MAX:.0f}x",
             lambda v: v < EV_EBITDA_MAX,
         ))
+        # #4 P/B Ratio: prefer Screener.in
+        _pb_ratio = (
+            screener_data.pb_ratio
+            if (screener_data and screener_data.pb_ratio is not None)
+            else info.get("priceToBook")
+        )
         params.append(self._check_scalar(
-            info.get("priceToBook"), "P/B Ratio", "Valuation",
+            _pb_ratio, "P/B Ratio", "Valuation",
             f"< {PB_RATIO_MAX:.0f}x",
             lambda v: v < PB_RATIO_MAX,
         ))
@@ -779,7 +851,12 @@ class SecondaryOverlayScreener:
             ))
 
         # ── Category 4: Asset Allocation ─────────────────────────────────────
-        roic = self._compute_roic(t, info)
+        # #14 ROIC: prefer Screener.in pre-calculated ROCE as proxy
+        roic = (
+            screener_data.roce_pct
+            if (screener_data and screener_data.roce_pct is not None)
+            else self._compute_roic(t, info)
+        )
         params.append(self._check_scalar(
             roic, "ROIC", "Asset Alloc",
             f">= {ROIC_MIN_PCT:.0f}%",
@@ -802,8 +879,9 @@ class SecondaryOverlayScreener:
             lambda v: v >= ASSET_TURNOVER_MIN,
         ))
 
-        # ── Category 5: Compound Growth ───────────────────────────────────────
-        rev3, rev5, ebitda3 = self._compute_cagrs(t)
+        # ── Category 5: Compound Growth ──────────────────────────────────────
+        # #18-20: prefer Screener.in annual series over yfinance financials
+        rev3, rev5, ebitda3 = self._compute_cagrs(t, screener_data)
         params.append(self._check_scalar(
             rev3, "3Y Revenue CAGR", "Growth",
             f">= {REVENUE_CAGR_3Y_MIN_PCT:.0f}%",
@@ -1069,9 +1147,31 @@ class SecondaryOverlayScreener:
             return None
 
     def _compute_cagrs(
-        self, t: yf.Ticker
+        self,
+        t: yf.Ticker,
+        screener_data: Optional[ScreenerInData] = None,
     ) -> tuple[Optional[float], Optional[float], Optional[float]]:
         rev3 = rev5 = ebitda3 = None
+
+        # Try Screener.in first for revenue and EBITDA series
+        if screener_data is not None:
+            try:
+                revs = screener_data.annual_revenue
+                if len(revs) >= 4 and revs[3] and revs[3] > 0:
+                    rev3 = ((revs[0] / revs[3]) ** (1 / 3) - 1) * 100
+                if len(revs) >= 6 and revs[5] and revs[5] > 0:
+                    rev5 = ((revs[0] / revs[5]) ** (1 / 5) - 1) * 100
+            except Exception:
+                pass
+            try:
+                ebs = screener_data.annual_ebitda
+                if len(ebs) >= 4 and ebs[3] and ebs[3] > 0:
+                    ebitda3 = ((ebs[0] / ebs[3]) ** (1 / 3) - 1) * 100
+            except Exception:
+                pass
+            if rev3 is not None or ebitda3 is not None:
+                return rev3, rev5, ebitda3
+
         try:
             fin = t.financials
             if fin is None or fin.empty:
@@ -1148,16 +1248,26 @@ class CandidateScreener:
     Gate 3/4 continue even with Manual Verify fields.
     """
 
-    def __init__(self) -> None:
-        self._stage2    = Stage2Checker()
-        self._ud        = UDRatioCalculator()
-        self._funds     = FundamentalScreener()
-        self._valuation = ValuationStressTester()
-        self._secondary = SecondaryOverlayScreener()
+    def __init__(
+        self, screener_client: Optional[ScreenerInClient] = None
+    ) -> None:
+        self._stage2          = Stage2Checker()
+        self._ud              = UDRatioCalculator()
+        self._funds           = FundamentalScreener()
+        self._valuation       = ValuationStressTester()
+        self._secondary       = SecondaryOverlayScreener()
+        self._screener_client = screener_client
 
     def screen(self, ticker: str) -> ScreeningResult:
         result = ScreeningResult(ticker=ticker)
         failed_gates: list[str] = []
+
+        # Fetch Screener.in data once; passed to fundamentals + overlay
+        screener_data = (
+            self._screener_client.fetch(ticker)
+            if self._screener_client is not None
+            else None
+        )
 
         # Gate 1 — always run
         g1 = self._stage2.check(ticker)
@@ -1174,7 +1284,7 @@ class CandidateScreener:
             failed_gates.append(f"Gate 2: WEAK — {g2.notes}")
 
         # Gates 3 + 4 — always run for full fundamental picture
-        g34 = self._funds.screen(ticker)
+        g34 = self._funds.screen(ticker, screener_data)
         result.gate3_gate4 = g34
         if not g34.passed:
             failed_gates.append(f"Gate 3/4: {g34.notes}")
@@ -1191,7 +1301,7 @@ class CandidateScreener:
             return result
 
         # All gates passed — run secondary overlay (advisory, never hard-fails)
-        result.secondary = self._secondary.run(ticker)
+        result.secondary = self._secondary.run(ticker, screener_data)
 
         manual_items   = g34.manual_verify_fields
         result.passed_all = True
@@ -1217,8 +1327,9 @@ class ScreeningRunner:
         self,
         notifier: TelegramNotifier,
         portfolio_value: float = 0.0,
+        screener_client: Optional[ScreenerInClient] = None,
     ) -> None:
-        self._screener        = CandidateScreener()
+        self._screener        = CandidateScreener(screener_client=screener_client)
         self._sizer           = PositionSizer()
         self._notifier        = notifier
         self._portfolio_value = portfolio_value
@@ -1418,6 +1529,7 @@ class ScreeningRunner:
 def screen(
     portfolio_value_inr: float = 0,
     tickers: Optional[list[str]] = None,
+    screener_client: Optional[ScreenerInClient] = None,
 ) -> list[ScreeningResult]:
     """
     Wire up dependencies and run the full screening pipeline.
@@ -1427,6 +1539,9 @@ def screen(
             Falls back to PORTFOLIO_VALUE_INR environment variable, then 0.
         tickers: Optional explicit list of NSE ticker symbols (without .NS suffix).
             If None, tickers are loaded from WATCHLIST_PATH.
+        screener_client: Optional authenticated Screener.in client. When provided,
+            fundamental metrics are sourced from Screener.in before falling back
+            to yfinance, eliminating most MANUAL_VERIFY entries for NSE stocks.
 
     Returns:
         List of ScreeningResult, one per ticker screened.
@@ -1434,6 +1549,19 @@ def screen(
     if portfolio_value_inr == 0:
         portfolio_value_inr = float(os.environ.get("PORTFOLIO_VALUE_INR", "0"))
 
+    if screener_client is None and ScreenerInClient.is_configured():
+        screener_client = ScreenerInClient()
+        logger.info("Screener.in client initialised (SCREENER_IN_SESSION found)")
+    elif screener_client is None:
+        logger.warning(
+            "SCREENER_IN_SESSION not set — running in yfinance-only mode; "
+            "fundamental metrics for NSE stocks may fall back to MANUAL_VERIFY"
+        )
+
     notifier = TelegramNotifier()
-    runner = ScreeningRunner(notifier=notifier, portfolio_value=portfolio_value_inr)
+    runner = ScreeningRunner(
+        notifier=notifier,
+        portfolio_value=portfolio_value_inr,
+        screener_client=screener_client,
+    )
     return runner.run(tickers=tickers)

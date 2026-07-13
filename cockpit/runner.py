@@ -26,7 +26,7 @@ from cockpit.config import (
     NIFTY_50_SYMBOL,
 )
 from cockpit.market_data import MarketDataService
-from cockpit.models import GttOrderSnapshot, HoldingSnapshot, VolumeSnapshot
+from cockpit.models import GttOrderSnapshot, HoldingFundamentalsRow, HoldingSnapshot, VolumeSnapshot
 from cockpit.portfolio import get_registry
 from cockpit.telegram import TelegramNotifier
 
@@ -476,6 +476,33 @@ class ReportFormatter:
         )
         return invested, current
 
+    @staticmethod
+    def _format_numbered_action_items(
+        items: list[str],
+        empty_message: str = "CLEAN — No action required",
+    ) -> str:
+        if not items:
+            return empty_message
+        return "\n".join(f"{i}. {item}" for i, item in enumerate(items, 1))
+
+    @staticmethod
+    def fundamentals_section(rows: list) -> str:
+        """Format a Screener.in holding fundamentals table for Telegram."""
+        lines = ["📊 <b>HOLDING FUNDAMENTALS (Screener.in)</b>",
+                 "TICKER     | ROCE%  | D/E   | Qtr PAT Gr% | Promo% | Status"]
+        status_emoji = {"STRONG": "💚", "WATCH": "🟡", "CONCERN": "🔴", "NO_DATA": "⚪"}
+        for row in rows:
+            roce  = f"{row.roce_pct:.1f}"  if row.roce_pct  is not None else "N/A"
+            de    = f"{row.de_ratio:.2f}"  if row.de_ratio  is not None else "N/A"
+            pat   = (f"{row.quarterly_pat_growth_pct:+.0f}%"
+                     if row.quarterly_pat_growth_pct is not None else "N/A")
+            promo = f"{row.promoter_pct:.1f}" if row.promoter_pct is not None else "N/A"
+            emoji = status_emoji.get(row.status, "")
+            lines.append(
+                f"{row.ticker:<10} | {roce:<7}| {de:<6}| {pat:<12}| {promo:<7}| {emoji} {row.status}"
+            )
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------
     # Action item generators
     # ------------------------------------------------------------------
@@ -560,6 +587,60 @@ class ReportFormatter:
 
 
 # ---------------------------------------------------------------------------
+# HoldingRequalifier
+# ---------------------------------------------------------------------------
+
+
+class HoldingRequalifier:
+    """Classifies an active holding's requalification status from Gate 1+2 results."""
+
+    @staticmethod
+    def _classify(g1, g2, ticker: str) -> tuple[str, str]:
+        """Return (status_description, action_flag).
+
+        g1: Stage2CheckResult  (attrs: passed, stage_label, ma_150)
+        g2: UDRatioResult      (attrs: passed, disqualified, distribution_flag, ud_50, ud_21)
+        """
+        if not g1.passed:
+            label = g1.stage_label or ""
+            if any(k in label for k in ("3", "4", "Declining")):
+                return f"THESIS VIOLATION — {label}", f"⚠️ REVIEW {ticker}"
+            if "Warning" in label or "flattening" in label.lower():
+                return f"Stage 2 Warning — {label}", f"⚠️ Tighten SL {ticker}"
+            return f"Stage 1 Basing — {label}", ""
+
+        if g2.disqualified:
+            return (
+                f"DISTRIBUTION DISQUALIFY — U/D_50={g2.ud_50:.2f}",
+                f"⚠️ EXIT CANDIDATE {ticker}",
+            )
+        if g2.distribution_flag:
+            return (
+                f"Near-term distribution (U/D_21={g2.ud_21:.2f})",
+                f"⚠️ Monitor {ticker}",
+            )
+        if not g2.passed:
+            return "Weak accumulation — U/D below threshold", ""
+
+        return "CONFIRMED ACCUMULATION — Gates 1+2 clear", ""
+
+
+# ---------------------------------------------------------------------------
+# HoldingFundamentalsChecker
+# ---------------------------------------------------------------------------
+
+
+class HoldingFundamentalsChecker:
+    """Fetches and classifies fundamental health for a list of tickers via Screener.in."""
+
+    def check_all(self, tickers: list[str], client) -> list[HoldingFundamentalsRow]:
+        return [
+            HoldingFundamentalsRow.from_screener(ticker, client.fetch(ticker))
+            for ticker in tickers
+        ]
+
+
+# ---------------------------------------------------------------------------
 # CockpitRunner
 # ---------------------------------------------------------------------------
 
@@ -572,10 +653,12 @@ class CockpitRunner:
         market_data: MarketDataService,
         notifier: TelegramNotifier,
         web_search: Optional[WebSearchClient] = None,
+        screener_client=None,
     ) -> None:
         self._market_data = market_data
         self._notifier = notifier
         self._web_search = web_search or WebSearchClient()
+        self._screener_client = screener_client
 
     # ------------------------------------------------------------------
     # Phase 1 — Pre-Market
@@ -656,6 +739,13 @@ class CockpitRunner:
             holding_snapshots=holding_snapshots,
         )
 
+        if self._screener_client is not None:
+            logger.info("Fetching holding fundamentals from Screener.in")
+            tickers = list(holding_snapshots.keys())
+            checker = HoldingFundamentalsChecker()
+            fund_rows = checker.check_all(tickers, self._screener_client)
+            message += "\n\n" + ReportFormatter.fundamentals_section(fund_rows)
+
         logger.info("Sending Phase 3 report to Telegram")
         self._notifier.send_chunked(message)
         logger.info("Phase 3 complete")
@@ -696,10 +786,16 @@ def run(phase: int) -> None:
     notifier = TelegramNotifier()
     web_search = WebSearchClient()
 
+    from cockpit.screener_in import ScreenerInClient
+    screener_client = ScreenerInClient() if ScreenerInClient.is_configured() else None
+    if screener_client is None and phase == 3:
+        logger.warning("SCREENER_IN_SESSION not set — Phase 3 holding fundamentals skipped")
+
     runner = CockpitRunner(
         market_data=market_data,
         notifier=notifier,
         web_search=web_search,
+        screener_client=screener_client,
     )
 
     if phase == 1:
